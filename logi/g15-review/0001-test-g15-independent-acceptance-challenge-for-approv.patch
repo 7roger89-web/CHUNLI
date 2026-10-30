@@ -1,0 +1,579 @@
+From 119689de78ed06367ef605bab03423b25f08acd4 Mon Sep 17 00:00:00 2001
+From: arena-agent <297053741+arena-agent@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 04:16:51 +0000
+Subject: [PATCH] test(g15): independent acceptance challenge for
+ approved-content integrity
+
+Adds a reviewer-side challenge suite (author of this file is not the author of
+the db9015e fix): same-version mutation of title/date/stage/kind, content swap
+between approved events, source deletion, transport-mode change, revoked
+verification/visibility, added pin without reapproval, missing or forged
+content digest, digest copied from another lot, foreign principal, non-admin
+write refusal, Streamlit rerender after mutation and tenant switch on the same
+mounted component.
+
+Repairs one real regression at PR HEAD: the reference-UI test added pins to a
+legacy seed manifest that carries no approved_content_sha256, which the new
+rule correctly rejects. It now publishes through the real Admin publisher, so
+the same intent is proven on the actual approval path.
+
+Full suite on this HEAD: 35 failed / 2148 passed vs 38 failed / 2115 passed
+before, no new failure set.
+---
+ docs/NEXT.md                                  |   3 +
+ evidence/g15-independent-review/README.md     |  71 ++++
+ ...stomer_portal_g15_independent_challenge.py | 400 ++++++++++++++++++
+ ...t_customer_portal_hexa_reference_ui_g15.py |  19 +-
+ 4 files changed, 485 insertions(+), 8 deletions(-)
+ create mode 100644 evidence/g15-independent-review/README.md
+ create mode 100644 tests/test_customer_portal_g15_independent_challenge.py
+
+diff --git a/docs/NEXT.md b/docs/NEXT.md
+index 39295f6..18f0598 100644
+--- a/docs/NEXT.md
++++ b/docs/NEXT.md
+@@ -14,6 +14,7 @@ Xây **Logistics Work Desk có thể sử dụng thật**, tập trung giao di
+ - **PR [#231](https://github.com/7roger89-web/logistics-work-desk-arena/pull/231):** đã merged vào nhánh staging; sửa luồng lưu/readback thông tin lô. Nghiệm thu thao tác trên Cloud còn thiếu bằng chứng.
+ - **PR [#226](https://github.com/7roger89-web/logistics-work-desk-arena/pull/226):** Draft, HEAD `9978e0a6ee120e8de2ea4838aa2c8e23746663f9`; phần *đọc* event/document theo customer_id và manifest PUBLISHED, pinned ID/version đã có trong source. Chưa chứng minh test runtime tại HEAD này và chưa tích hợp staging.
+ - **PR [#232](https://github.com/7roger89-web/logistics-work-desk-arena/pull/232):** nhắm staging, đã nhận bản sửa bảo mật và các test từ nhánh Arena QA bằng fast-forward không force; **Draft sau phát hiện lỗi toàn vẹn nội dung**, chưa merge staging. SHA code QA mốc `dd1c63d94024caeff76fef0699179c3cc38d7f6e`; HEAD cuối phải đo lại. Đã có focused pytest 143 PASS trên môi trường mongomock + browser giả lập, không chứng minh đăng nhập Google/Cloud thật. PR #226 vẫn Draft, chưa thay đổi.
++- **PR [#232] reviewed độc lập (2026-10-30, actor khác tác giả fix):** reviewer khác chạy focused G1/G1.5 tại HEAD `968e7cf` trên pymongo/mongomock + Streamlit thật: **186 PASS**, gồm 29 test challenge mới (`tests/test_customer_portal_g15_independent_challenge.py`) và đột biến tắt kiểm tra hash nội dung làm **25 test FAIL** (bằng chứng test không rỗng). Sửa 1 test hồi quy thật tại HEAD: `test_owner_granted_publication_fields_reach_the_ui_without_scope_change` giờ tạo bản công bố qua Admin publisher thật. Full suite cùng lệnh: 38F/2115P (trước) → **35F/2148P** (sau), không có lỗi mới. Bằng chứng: `evidence/g15-independent-review/README.md`. `CLOUD_QA=BLOCKED` vẫn đứng.
+ - **`main` tham chiếu:** `9e4190b278dd2ced8771c5249582753d34e561db`. **Không được tự merge/deploy production**; đây chỉ là ref tại thời điểm quan sát.
+ 
+ ## QA follow-up — bản sửa đã fast-forward vào PR #232
+@@ -63,4 +64,6 @@ Xây **Logistics Work Desk có thể sử dụng thật**, tập trung giao di
+ 
+ - **2026-10-30 (integrity):** Reviewer giả lập phát hiện same-version mutation, kết luận REJECT. Fix hash content tại `db9015e60b2621fb5aae154caa20bf2bb42930c4` trên PR #232; offline 37/37 PASS, pytest repo và review độc lập sau fix chưa có. **Không merge staging/main**.
+ 
++- **2026-10-30 (independent review PASS):** actor khác tác giả fix nghiệm thu HEAD `968e7cf` bằng focused suite + rerender Streamlit + đột biến; sửa 1 test hồi quy và thêm 29 challenge test. PR #232 đủ điều kiện tích hợp **staging**; `main`/production giữ nguyên, `CLOUD_QA=BLOCKED` (deployed SHA + DB identity chưa xác minh). Bắt đầu lát tiếp theo: **comment + chứng từ theo công đoạn Journey** trên nhánh phụ thuộc #232.
++
+ **Hướng dẫn duy trì:** Trước khi chọn task, so mục tiêu Owner + GoalPlan/TaskPlan với GitHub thực tế và checkpoint này. Chỉ cập nhật GOAL/CURRENT/NEXT/BLOCKERS và append **một dòng mốc có PR/SHA/bằng chứng** khi kết quả hoặc ưu tiên thực sự đổi. Không ghi nhật ký mỗi lệnh; không tự nhận đã cập nhật nếu chưa commit thành công.
+diff --git a/evidence/g15-independent-review/README.md b/evidence/g15-independent-review/README.md
+new file mode 100644
+index 0000000..e6892e2
+--- /dev/null
++++ b/evidence/g15-independent-review/README.md
+@@ -0,0 +1,71 @@
++# G1.5 independent acceptance review — PR #232 (staging)
++
++Reviewer: Arena agent on branch `arena/5bc30481-chunli` (NOT the author of the
++`db9015e` content-integrity fix). Repository: `7roger89-web/logistics-work-desk-arena`.
++
++PR HEAD reviewed: `968e7cfb945a2e2b269a2829576d86df021f27b5` + this review commit.
++Runtime: Python 3.11.2, pytest 9.2.0, streamlit 1.66.1, mongomock 4.3.0,
++pymongo 4.19.0, jsdom 30 (component DOM test). Isolated in-memory Mongo only —
++no Cloud, no production, no real customer data.
++
++## What was challenged
++
++The reported blocker: Admin publishes `E/v1`, then a source field is edited
++while the id/version/verified flags stay the same — the customer must not see
++the edited content.
++
++| Check | Result |
++| --- | --- |
++| Focused G1/G1.5 suites at this HEAD | 186 passed (incl. 29 new independent tests) |
++| Same-version edit of title / occurred_at / stage / document title / kind | denied, whole card hidden |
++| Content swapped between two approved events | denied |
++| Approved source deleted / transport_mode changed / verified or visibility revoked | denied |
++| New pin added to a manifest without a new approval | denied |
++| Missing `approved_content_sha256` on a pinned manifest | denied |
++| Forged digest of an attacker-built projection | denied |
++| Digest copied from another lot | denied |
++| Unpinned legacy release | visible with empty timeline/documents, no data invented |
++| Whitespace-only source edit | still visible (no false revocation) |
++| Other customer principal / foreign manifest | denied, no cross-tenant text |
++| Viewer/sale/support/operations/unknown write | `PublicationWriteDenied`, no manifest written |
++| Streamlit rerender after mutation (AppTest) | payload drops the lot, unapproved text absent |
++| Tenant switch on the same mounted component | payload resets, previous customer's text absent |
++
++## Mutation proof the tests are not vacuous
++
++Disabling only the content-digest check in `core/customer_portal.py`
++(`if manifest.get("event_versions") or ...` -> `if False:`) makes **25 tests
++fail**, 13 of them from the new independent challenge file. Command:
++`python -m pytest tests/test_customer_portal_g15_independent_challenge.py tests/test_customer_portal_sources_g15.py tests/test_customer_portal_publish_g15.py -q`.
++
++## One test repaired (real regression from the fix)
++
++`tests/test_customer_portal_hexa_reference_ui_g15.py::test_owner_granted_publication_fields_reach_the_ui_without_scope_change`
++failed at PR HEAD: it added pins to a legacy seed manifest that carries no
++`approved_content_sha256`, which the new rule (correctly) rejects. The test now
++creates the release through the real Admin publisher
++(`core.customer_portal_publish.publish_verified_sources`), so it still proves an
++Owner-approved release reaches the UI and never widens the tenant — and it now
++exercises the actual approval path instead of a hand-built manifest.
++
++## Full-suite comparison (same environment, same command)
++
++`python -m pytest tests -q --continue-on-collection-errors -p no:cacheprovider`
++
++- PR HEAD (before this commit): **38 failed, 2115 passed, 45 skipped**
++- After this commit: **35 failed, 2148 passed, 44 skipped**
++
++Fixed: the reference-UI test above, the component tenant-reset DOM test, the
++inbox DOM test and one React header regression test (the last three only need
++`npm install` in `component/`). No new failure set; the single difference
++`test_gnt_revision_comes_from_durable_docgen_metadata_after_session_clear`
++passes in isolation on both trees (order-dependent flake, unrelated to G1.5).
++
++## Verdict
++
++`PROVEN` for the code/test layer at this HEAD on isolated data.
++Still **not** proven here (separate gates, unchanged):
++`CLOUD_QA=BLOCKED` (deployed SHA and runtime DB identity unverified), real
++Google OIDC login, and the completeness of real Lục Giác approved business
++provenance. No merge to `main`, no production deploy, no writes to real
++customer data.
+diff --git a/tests/test_customer_portal_g15_independent_challenge.py b/tests/test_customer_portal_g15_independent_challenge.py
+new file mode 100644
+index 0000000..b9f85d9
+--- /dev/null
++++ b/tests/test_customer_portal_g15_independent_challenge.py
+@@ -0,0 +1,400 @@
++"""G1.5 independent acceptance challenge (reviewer != fix author).
++
++This file is deliberately written from the acceptance contract, not from the
++implementation: publish ``E/v1``, then attack the release and prove the
++customer never sees unapproved content. It runs on an isolated in-memory Mongo
++handle (mongomock) plus the real Streamlit AppTest entrypoint. No production,
++Cloud or real customer data is touched.
++"""
++from __future__ import annotations
++
++import json
++import time
++from pathlib import Path
++from unittest.mock import patch
++
++import mongomock
++import pytest
++from streamlit.testing.v1 import AppTest
++
++from core import customer_portal as portal
++from core import customer_portal_publish as publication
++from core.hexa_customer_publication import (
++    PUBLICATION_SCHEMA, build_customer_publication, approved_content_fingerprint,
++)
++
++ROOT = Path(__file__).resolve().parents[1]
++APP_PATH = ROOT / "app.py"
++
++CUSTOMER_A = "CUST-LUCGIAC"
++CUSTOMER_B = "CUST-MINHDUC"
++EMAIL_A = "portal.lucgiac@example.com"
++EMAIL_B = "portal.minhduc@example.com"
++LOT_A = "G1-LG-001"
++LOT_B = "G1-MD-001"
++
++EV_1_TITLE = "Đã lấy hàng tại kho Lục Giác"
++DOC_1_TITLE = "Packing List đã duyệt"
++
++FAKE_AUTH = {
++    "required": True,
++    "redirect_uri": "http://localhost:8501/oauth2callback",
++    "cookie_secret": "S" * 48,
++    "google": {
++        "client_id": "staging-client-id.apps.googleusercontent.com",
++        "client_secret": "STAGING_TEST_ONLY_CLIENT_SECRET",
++        "server_metadata_url": "https://accounts.google.com/.well-known/openid-configuration",
++    },
++}
++
++
++def _claims(email: str):
++    return {
++        "is_logged_in": True, "provider": "google",
++        "aud": FAKE_AUTH["google"]["client_id"], "iss": "https://accounts.google.com",
++        "email": email, "email_verified": True,
++        "exp": int(time.time()) + 600, "sub": "staging-google-subject",
++    }
++
++
++@pytest.fixture
++def db():
++    database = mongomock.MongoClient()["g15_independent_challenge"]
++    database.customers.insert_many([
++        {"id": CUSTOMER_A, "name": "Lục Giác", "portal_access_email": EMAIL_A},
++        {"id": CUSTOMER_B, "name": "Minh Đức", "portal_access_email": EMAIL_B},
++    ])
++    database.shipments.insert_many([
++        {"id": LOT_A, "customer_id": CUSTOMER_A, "transport_mode": "SEA",
++         "internal_cost": "SECRET_INTERNAL_COST"},
++        {"id": LOT_B, "customer_id": CUSTOMER_B, "transport_mode": "ROAD"},
++    ])
++    database.public_events.insert_many([
++        {"id": "EV-1", "version": "v1", "customer_id": CUSTOMER_A, "shipment_id": LOT_A,
++         "stage_id": "pickup", "public_title": EV_1_TITLE,
++         "occurred_at": "2026-10-28T01:00:00Z", "verified": True,
++         "verified_at": "2026-10-28T02:00:00Z", "visibility": "CUSTOMER",
++         "internal_note": "SECRET_EVENT_NOTE"},
++        {"id": "EV-2", "version": "v1", "customer_id": CUSTOMER_A, "shipment_id": LOT_A,
++         "stage_id": "customs_import", "public_title": "Đã thông quan nhập",
++         "occurred_at": "2026-10-29T01:00:00Z", "verified": True,
++         "verified_at": "2026-10-29T02:00:00Z", "visibility": "CUSTOMER"},
++    ])
++    database.public_documents.insert_many([
++        {"id": "DOC-1", "version": "v1", "customer_id": CUSTOMER_A, "shipment_id": LOT_A,
++         "kind": "PL", "public_title": DOC_1_TITLE, "status": "AVAILABLE",
++         "verified": True, "visibility": "CUSTOMER",
++         "storage_file_id": "SECRET_GRIDFS_ID"},
++        {"id": "DOC-2", "version": "v1", "customer_id": CUSTOMER_A, "shipment_id": LOT_A,
++         "kind": "BL", "public_title": "Vận đơn đường biển", "status": "AVAILABLE",
++         "verified": True, "visibility": "CUSTOMER"},
++        {"id": "DOC-9", "version": "v1", "customer_id": CUSTOMER_B, "shipment_id": LOT_B,
++         "kind": "PL", "public_title": "Packing list của Minh Đức", "status": "AVAILABLE",
++         "verified": True, "visibility": "CUSTOMER"},
++    ])
++    return database
++
++
++def _publish(db, *, events=None, docs=None, current="", role="admin", lot=LOT_A,
++             customer=CUSTOMER_A, username="staging-admin"):
++    return publication.publish_verified_sources(
++        customer, lot,
++        event_versions={"EV-1": "v1", "EV-2": "v1"} if events is None else events,
++        document_versions={"DOC-1": "v1", "DOC-2": "v1"} if docs is None else docs,
++        expected_current_version=current, actor_role=role, actor_username=username, db=db,
++    )
++
++
++def _view(db, email=EMAIL_A):
++    principal = portal.build_customer_principal(verified_email=email, db=db)
++    return portal.load_customer_dashboard(principal, db=db)
++
++
++def _released(db, lot=LOT_A):
++    ok, message = _publish(db, lot=lot)
++    assert ok is True, message
++    return db.shipments.find_one({"id": lot})["customer_publication_version"]
++
++
++# --------------------------------------------------------------------------
++# 1. The reported blocker: same-version source edit after approval
++# --------------------------------------------------------------------------
++
++def test_approved_release_is_visible_and_complete(db):
++    _released(db)
++    card = _view(db).cards[0]
++    assert card.reference == LOT_A
++    assert {e["title"] for e in card.timeline} == {EV_1_TITLE, "Đã thông quan nhập"}
++    assert {d["title"] for d in card.documents} == {DOC_1_TITLE, "Vận đơn đường biển"}
++    payload = json.dumps([dict(e) for e in card.timeline] + [dict(d) for d in card.documents])
++    assert "SECRET" not in payload
++
++
++@pytest.mark.parametrize("collection, record_id, field, value", [
++    ("public_events", "EV-1", "public_title", "CHANGED_WITHOUT_APPROVAL"),
++    ("public_events", "EV-1", "occurred_at", "2026-11-30T01:00:00Z"),
++    ("public_events", "EV-1", "stage_id", "delivered"),
++    ("public_documents", "DOC-1", "public_title", "CHANGED_WITHOUT_APPROVAL"),
++    ("public_documents", "DOC-1", "kind", "CUSTOMER_QUOTE"),
++])
++def test_same_version_source_edit_hides_the_whole_card(db, collection, record_id, field, value):
++    _released(db)
++    db[collection].update_one({"id": record_id}, {"$set": {field: value}})
++    view = _view(db)
++    assert view.cards == ()
++    assert view.denied_lots == 1
++    assert "CHANGED_WITHOUT_APPROVAL" not in str(view)
++
++
++def test_whitespace_only_source_change_is_not_a_new_release(db):
++    """Identical visible content must not be revoked by a normalised edit."""
++    _released(db)
++    db.public_events.update_one(
++        {"id": "EV-1"}, {"$set": {"public_title": f"  {EV_1_TITLE}  "}})
++    view = _view(db)
++    assert len(view.cards) == 1 and view.denied_lots == 0
++    assert {e["title"] for e in view.cards[0].timeline} == {EV_1_TITLE, "Đã thông quan nhập"}
++
++
++def test_swapping_content_between_two_approved_events_is_detected(db):
++    _released(db)
++    first = db.public_events.find_one({"id": "EV-1"})["public_title"]
++    second = db.public_events.find_one({"id": "EV-2"})["public_title"]
++    db.public_events.update_one({"id": "EV-1"}, {"$set": {"public_title": second}})
++    db.public_events.update_one({"id": "EV-2"}, {"$set": {"public_title": first}})
++    view = _view(db)
++    assert view.cards == () and view.denied_lots == 1
++
++
++def test_deleting_an_approved_source_denies_the_card(db):
++    _released(db)
++    db.public_events.delete_one({"id": "EV-2"})
++    view = _view(db)
++    assert view.cards == () and view.denied_lots == 1
++
++
++def test_changing_transport_mode_after_approval_denies_the_card(db):
++    _released(db)
++    db.shipments.update_one({"id": LOT_A}, {"$set": {"transport_mode": "ROAD"}})
++    view = _view(db)
++    assert view.cards == () and view.denied_lots == 1
++
++
++def test_revoking_source_verification_or_visibility_denies_the_card(db):
++    _released(db)
++    db.public_documents.update_one({"id": "DOC-1"}, {"$set": {"visibility": "TT"}})
++    assert _view(db).cards == ()
++    db.public_documents.update_one({"id": "DOC-1"}, {"$set": {"visibility": "CUSTOMER"}})
++    assert len(_view(db).cards) == 1
++    db.public_documents.update_one({"id": "DOC-1"}, {"$set": {"status": "PENDING"}})
++    assert _view(db).cards == ()
++    db.public_documents.update_one({"id": "DOC-1"}, {"$set": {"status": "AVAILABLE"}})
++    db.public_events.update_one({"id": "EV-1"}, {"$set": {"verified": False}})
++    assert _view(db).cards == ()
++
++
++def test_adding_a_new_pin_without_reapproval_denies_the_card(db):
++    ok, _ = _publish(db, events={"EV-1": "v1"}, docs={"DOC-1": "v1"})
++    assert ok
++    manifest = db.customer_publications.find_one(
++        {"shipment_id": LOT_A, "version": db.shipments.find_one({"id": LOT_A})[
++            "customer_publication_version"]})
++    db.customer_publications.update_one(
++        {"_id": manifest["_id"]}, {"$set": {"event_versions.EV-2": "v1"}})
++    view = _view(db)
++    assert view.cards == () and view.denied_lots == 1
++
++
++# --------------------------------------------------------------------------
++# 2. Hash integrity attacks
++# --------------------------------------------------------------------------
++
++def test_missing_hash_on_a_pinned_manifest_denies_the_card(db):
++    _released(db)
++    db.customer_publications.update_one(
++        {"shipment_id": LOT_A}, {"$unset": {"approved_content_sha256": ""}})
++    view = _view(db)
++    assert view.cards == () and view.denied_lots == 1
++
++
++def test_forged_hash_of_an_attacker_projection_is_still_denied(db):
++    _released(db)
++    db.public_events.update_one(
++        {"id": "EV-1"}, {"$set": {"public_title": "CHANGED_WITHOUT_APPROVAL"}})
++    forged = build_customer_publication(
++        shipment={"id": LOT_A, "customer_id": CUSTOMER_A, "transport_mode": "SEA"},
++        principal={"kind": "customer", "authenticated": True, "customer_id": CUSTOMER_A},
++        publication={"schema": PUBLICATION_SCHEMA, "customer_id": CUSTOMER_A,
++                     "shipment_id": LOT_A, "version": "v1", "state": "PUBLISHED",
++                     "approved_by": "staging-admin", "approved_at": "now",
++                     "event_versions": {"EV-1": "v1"}, "document_versions": {}},
++        events=[{"id": "EV-1", "version": "v1", "customer_id": CUSTOMER_A,
++                 "shipment_id": LOT_A, "stage_id": "pickup",
++                 "public_title": "CHANGED_WITHOUT_APPROVAL",
++                 "occurred_at": "2026-10-28T01:00:00Z", "verified": True,
++                 "verified_at": "2026-10-28T02:00:00Z", "visibility": "CUSTOMER"}],
++        documents=[],
++    )
++    db.customer_publications.update_one(
++        {"shipment_id": LOT_A},
++        {"$set": {"approved_content_sha256": approved_content_fingerprint(forged)}})
++    view = _view(db)
++    assert view.cards == ()
++    assert "CHANGED_WITHOUT_APPROVAL" not in str(view)
++
++
++def test_hash_copied_from_another_lot_does_not_authorise_this_lot(db):
++    version_a = _released(db, lot=LOT_A)
++    manifest_a = db.customer_publications.find_one({"shipment_id": LOT_A, "version": version_a})
++    # Reuse the approved digest on a second lot that approved identical content.
++    ok, message = _publish(db, lot=LOT_B, customer=CUSTOMER_B,
++                           events={}, docs={"DOC-9": "v1"})
++    assert ok, message
++    version_b = db.shipments.find_one({"id": LOT_B})["customer_publication_version"]
++    db.customer_publications.update_one(
++        {"shipment_id": LOT_B, "version": version_b},
++        {"$set": {"approved_content_sha256": manifest_a["approved_content_sha256"]}})
++    view = portal.load_customer_dashboard(
++        portal.build_customer_principal(verified_email=EMAIL_B, db=db), db=db)
++    assert view.cards == () and view.denied_lots == 1
++
++
++def test_unpinned_legacy_release_shows_nothing_and_is_not_denied(db):
++    db.customer_publications.insert_one({
++        "id": f"{CUSTOMER_A}:{LOT_A}:legacy", "schema": PUBLICATION_SCHEMA,
++        "customer_id": CUSTOMER_A, "shipment_id": LOT_A, "version": "legacy",
++        "state": "PUBLISHED", "approved_by": "staging-owner",
++        "approved_at": "2026-10-24T08:00:00Z",
++        "event_versions": {}, "document_versions": {},
++    })
++    db.shipments.update_one(
++        {"id": LOT_A}, {"$set": {"customer_publication_version": "legacy"}})
++    view = _view(db)
++    assert len(view.cards) == 1
++    assert view.cards[0].timeline == () and view.cards[0].documents == ()
++
++
++def test_repeated_reads_of_an_unchanged_release_stay_visible(db):
++    _released(db)
++    for _ in range(3):
++        view = _view(db)
++        assert len(view.cards) == 1 and view.denied_lots == 0
++
++
++# --------------------------------------------------------------------------
++# 3. Tenant boundary, roles and writes
++# --------------------------------------------------------------------------
++
++def test_other_customer_never_sees_the_lot(db):
++    _released(db)
++    view = _view(db, email=EMAIL_B)
++    # B's own unpublished lot is denied, but nothing of A crosses over.
++    assert view.cards == ()
++    assert view.denied_lots == 1  # B's lot has no approved release
++    text = str(view)
++    assert LOT_A not in text and EV_1_TITLE not in text and DOC_1_TITLE not in text
++
++
++def test_foreign_principal_cannot_read_a_pinned_manifest_of_another_customer(db):
++    _released(db)
++    manifest = db.customer_publications.find_one({"shipment_id": LOT_A})
++    with pytest.raises(PermissionError):
++        build_customer_publication(
++            shipment={"id": LOT_A, "customer_id": CUSTOMER_A},
++            principal={"kind": "customer", "authenticated": True, "customer_id": CUSTOMER_B},
++            publication=manifest,
++        )
++
++
++@pytest.mark.parametrize("role", ["viewer", "sale", "support", "operations", "", None])
++def test_non_admin_backend_write_is_refused(db, role):
++    with pytest.raises(publication.PublicationWriteDenied):
++        _publish(db, role=role)
++    assert db.customer_publications.count_documents({}) == 0
++    assert db.shipments.find_one({"id": LOT_A}).get("customer_publication_version") is None
++
++
++def test_viewer_cannot_overwrite_an_existing_release(db):
++    current = _released(db)
++    manifests_before = list(db.customer_publications.find().sort("id", 1))
++    with pytest.raises(publication.PublicationWriteDenied):
++        _publish(db, role="viewer", current=current, events={"EV-1": "v1"}, docs={})
++    assert db.shipments.find_one({"id": LOT_A})["customer_publication_version"] == current
++    assert list(db.customer_publications.find().sort("id", 1)) == manifests_before
++
++
++def test_admin_cannot_publish_another_customers_lot(db):
++    with pytest.raises(publication.PublicationWriteDenied):
++        _publish(db, lot=LOT_B, events={}, docs={"DOC-9": "v1"})
++    assert db.customer_publications.count_documents({}) == 0
++
++
++# --------------------------------------------------------------------------
++# 4. Runtime: reload, tenant switch and document rendering (real Streamlit)
++# --------------------------------------------------------------------------
++
++def _model(app):
++    assert not app.exception, [str(element.value) for element in app.exception]
++    components = app.get("bidi_component")
++    assert len(components) == 1, f"expected one mounted portal, got {len(components)}"
++    return json.loads(components[0].proto.json)["model"]
++
++
++def _app(db, email):
++    app = AppTest.from_file(str(APP_PATH), default_timeout=120)
++    app.secrets = {"auth": FAKE_AUTH}
++    return app
++
++
++def test_customer_sees_approved_timeline_and_documents_then_nothing_after_mutation(db):
++    _released(db)
++    app = _app(db, EMAIL_A)
++    with (
++        patch("streamlit.user_info._get_user_info", return_value=_claims(EMAIL_A)),
++        patch.object(portal, "get_db", return_value=db),
++    ):
++        app.run()
++        payload = _model(app)
++        lots = payload["lots"]
++        assert len(lots) == 1 and lots[0]["shipment_id"] == LOT_A
++        assert EV_1_TITLE in json.dumps(lots, ensure_ascii=False)
++        assert DOC_1_TITLE in json.dumps(lots, ensure_ascii=False)
++        assert "SECRET" not in json.dumps(payload, ensure_ascii=False)
++        # A plain reload is stable while nothing changed.
++        app.run()
++        assert _model(app)["lots"] == lots
++        # Trường Thành edits an approved source without a new version.
++        db.public_events.update_one(
++            {"id": "EV-1"}, {"$set": {"public_title": "CHANGED_WITHOUT_APPROVAL"}})
++        app.run()
++        after = _model(app)
++    assert after["lots"] == []
++    text_after = json.dumps(after, ensure_ascii=False)
++    assert "CHANGED_WITHOUT_APPROVAL" not in text_after
++    assert EV_1_TITLE not in text_after and DOC_1_TITLE not in text_after
++
++
++def test_switching_customer_on_the_same_component_resets_the_payload(db):
++    _released(db)
++    ok, message = _publish(db, lot=LOT_B, customer=CUSTOMER_B, events={}, docs={"DOC-9": "v1"})
++    assert ok, message
++    app = _app(db, EMAIL_A)
++    with (
++        patch("streamlit.user_info._get_user_info", return_value=_claims(EMAIL_A)),
++        patch.object(portal, "get_db", return_value=db),
++    ):
++        app.run()
++        payload_a = _model(app)
++    assert [lot["shipment_id"] for lot in payload_a["lots"]] == [LOT_A]
++    assert payload_a["customer"]["name"] == "Lục Giác"
++    # Same component instance, different principal after a session switch.
++    with (
++        patch("streamlit.user_info._get_user_info", return_value=_claims(EMAIL_B)),
++        patch.object(portal, "get_db", return_value=db),
++    ):
++        app.run()
++        payload_b = _model(app)
++    assert [lot["shipment_id"] for lot in payload_b["lots"]] == [LOT_B]
++    assert payload_b["customer"]["name"] == "Minh Đức"
++    text_b = json.dumps(payload_b, ensure_ascii=False)
++    assert LOT_A not in text_b and EV_1_TITLE not in text_b and DOC_1_TITLE not in text_b
+diff --git a/tests/test_customer_portal_hexa_reference_ui_g15.py b/tests/test_customer_portal_hexa_reference_ui_g15.py
+index 6a613d2..1b34c67 100644
+--- a/tests/test_customer_portal_hexa_reference_ui_g15.py
++++ b/tests/test_customer_portal_hexa_reference_ui_g15.py
+@@ -34,6 +34,7 @@ from streamlit.testing.v1 import AppTest
+ from core import customer_journey as journey
+ from core import customer_portal as portal
+ from core import customer_portal_oidc as oidc
++from core import customer_portal_publish as publication
+ from views import web_app
+ 
+ ROOT = Path(__file__).resolve().parents[1]
+@@ -437,14 +438,6 @@ def test_no_lots_state_is_safe_and_still_mounted_once(seed_module):
+ def test_owner_granted_publication_fields_reach_the_ui_without_scope_change(seed_module):
+     """An Owner-approved release is shown; it never widens the tenant."""
+     db = _db(seed_module, negative_cases=False)
+-    db.customer_publications.update_one(
+-        {"shipment_id": seed_module.LOT_A1},
+-        {"$set": {
+-            "event_versions": {"EV-1": "v1"},
+-            "document_versions": {"DOC-1": "v1"},
+-            "quote": {"id": "QT-9", "version": "v1"},
+-        }},
+-    )
+     db.shipments.update_one({"id": seed_module.LOT_A1}, {"$set": {"quote_id": "QT-9"}})
+     db.public_events = db["public_events"]
+     db.public_events.insert_one({
+@@ -464,6 +457,16 @@ def test_owner_granted_publication_fields_reach_the_ui_without_scope_change(seed
+         "id": "QT-9", "version": "v1", "customer_id": seed_module.CUSTOMER_A_ID,
+         "status": "SENT", "calculation": {"selling_price_total_vnd": 1000.0},
+     })
++    # G1.5: only an Admin-approved release is readable. The publisher stores the
++    # digest of the exact allowlisted projection, so this stays the ONE path
++    # that puts approved source fields on the customer card.
++    approved, message = publication.publish_verified_sources(
++        seed_module.CUSTOMER_A_ID, seed_module.LOT_A1,
++        event_versions={"EV-1": "v1"}, document_versions={"DOC-1": "v1"},
++        expected_current_version="v1", actor_role="admin",
++        actor_username="staging-owner", db=db,
++    )
++    assert approved, message
+ 
+     card = portal.load_customer_dashboard(
+         portal.CustomerPrincipal(
+-- 
+2.39.5
+

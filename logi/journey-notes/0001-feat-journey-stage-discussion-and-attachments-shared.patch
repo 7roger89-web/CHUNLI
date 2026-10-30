@@ -1,0 +1,1386 @@
+From 7989e68f1f06f10737640532db6d053b3f4e9d99 Mon Sep 17 00:00:00 2001
+From: arena-agent <297053741+arena-agent@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 04:34:40 +0000
+Subject: [PATCH] feat(journey): stage discussion and attachments shared by
+ staff and the portal
+
+One thread per customer + lot + journey stage, stored in the EXISTING
+quick_notes collection (kind=journey_note). Files go through the already
+configured note byte store (core.inbox_attachments -> GridFS by default,
+Drive only when configured); a failed store leaves no note and compensates
+the bytes it wrote.
+
+Permissions: staff with shipment_edit read and write both internal and
+customer-visible content; a customer only ever sees CUSTOMER content on their
+own lot and any content they write is forced to CUSTOMER. Attachment reads
+re-prove the note, the tenant and the exact file id before any byte is read.
+
+Wired into the shipment detail pane (staff) and below the customer journey map.
+tests/test_journey_notes.py: 31 passed, including a real Streamlit AppTest post
++ reload on the customer portal and three mutations that fail the suite.
+Full suite: 34 failed / 2178 passed vs 38 failed / 2115 passed at the PR head.
+---
+ core/journey_notes.py            | 425 ++++++++++++++++++++++++
+ docs/NEXT.md                     |   4 +
+ evidence/journey-notes/README.md |  72 ++++
+ tests/test_journey_notes.py      | 543 +++++++++++++++++++++++++++++++
+ views/customer_dashboard.py      |   9 +
+ views/journey_discussion.py      | 221 +++++++++++++
+ views/shipment.py                |  12 +
+ 7 files changed, 1286 insertions(+)
+ create mode 100644 core/journey_notes.py
+ create mode 100644 evidence/journey-notes/README.md
+ create mode 100644 tests/test_journey_notes.py
+ create mode 100644 views/journey_discussion.py
+
+diff --git a/core/journey_notes.py b/core/journey_notes.py
+new file mode 100644
+index 0000000..7f9740f
+--- /dev/null
++++ b/core/journey_notes.py
+@@ -0,0 +1,425 @@
++"""Trao đổi theo công đoạn lô hàng (Trường Thành ↔ một khách hàng).
++
++Một luồng trao đổi duy nhất, gắn đúng **khách hàng + lô hàng + công đoạn**:
++
++* lưu trong **collection ``quick_notes`` đang có** (``kind="journey_note"``),
++  cùng chỗ với Quick Notes/mẩu tin hộp thư đến; không tạo kho lưu trữ mới;
++* tệp đính kèm đi qua **đúng adapter kho chứng từ đang dùng**
++  (:mod:`core.inbox_attachments` → GridFS hoặc Drive đã cấu hình). Không giả
++  định Google Drive: backend được đọc tại runtime và báo lỗi rõ ràng nếu chưa
++  cấu hình;
++* hai lớp nội dung: ``INTERNAL`` (chỉ Trường Thành) và ``CUSTOMER`` (khách xem
++  được). Khách hàng **không bao giờ** đọc được nội dung nội bộ và **không thể**
++  tự nâng quyền nội dung của mình lên nội bộ.
++
++Danh tính luôn do server quyết định: khách hàng chỉ được phép ghi vào lô của
++chính mình, đã đối chiếu ``shipments.customer_id``. Không nhận ``customer_id``
++từ trình duyệt ở phía cổng khách.
++"""
++from __future__ import annotations
++
++import logging
++from collections.abc import Mapping, Sequence
++from datetime import datetime, timezone
++from typing import Any
++from uuid import uuid4
++
++LOGGER = logging.getLogger("logistics.journey_notes")
++
++JOURNEY_NOTE_KIND = "journey_note"
++NOTE_COLLECTION = "quick_notes"
++
++VISIBILITY_INTERNAL = "INTERNAL"
++VISIBILITY_CUSTOMER = "CUSTOMER"
++VISIBILITIES = (VISIBILITY_INTERNAL, VISIBILITY_CUSTOMER)
++
++#: Write gate reuses the SINGLE existing role matrix, same permission as the
++#: existing Quick Notes/inbox snippet writer.
++WRITE_PERMISSION = "shipment_edit"
++
++MAX_BODY = 4000
++MAX_NOTES_READ = 200
++MAX_FILES_PER_SUBMIT = 4
++
++STAGE_IDS: tuple[str, ...] = (
++    "plan", "pickup", "consolidate", "transit", "customs", "delivery", "finance",
++)
++STAGE_LABELS: dict[str, str] = {
++    "plan": "Kế hoạch",
++    "pickup": "Lấy hàng",
++    "consolidate": "Gom hàng",
++    "transit": "Vận chuyển",
++    "customs": "Thông quan",
++    "delivery": "Giao hàng",
++    "finance": "Thanh toán",
++}
++
++_PROJECTION = {
++    "_id": 0, "id": 1, "kind": 1, "customer_id": 1, "shipment_id": 1,
++    "stage_id": 1, "body": 1, "visibility": 1, "author_kind": 1,
++    "author_name": 1, "author_role": 1, "created_at": 1, "attachments": 1,
++}
++
++
++class JourneyNoteDenied(PermissionError):
++    """Fail-closed refusal for an unauthorised or unscoped note action."""
++
++
++def _clean(value: Any, limit: int = 0) -> str:
++    if value is None or isinstance(value, bool):
++        return ""
++    if not isinstance(value, (str, int, float)):
++        return ""
++    text = str(value).replace("\r", " ").strip()
++    return text[:limit] if limit else text
++
++
++def _now() -> str:
++    return datetime.now(timezone.utc).isoformat()
++
++
++def _resolve_db(db: Any = None) -> Any:
++    if db is not None:
++        return db
++    from core.database import get_db
++
++    try:
++        resolved = get_db()
++    except Exception:  # noqa: BLE001 - config/identity errors fail closed
++        LOGGER.warning("JOURNEY_NOTE_DB_UNAVAILABLE")
++        raise JourneyNoteDenied("Cơ sở dữ liệu chưa sẵn sàng.") from None
++    if resolved is None:
++        LOGGER.warning("JOURNEY_NOTE_DB_UNAVAILABLE reason=None")
++        raise JourneyNoteDenied("Cơ sở dữ liệu chưa sẵn sàng.")
++    return resolved
++
++
++def _user_may_write(role: Any) -> bool:
++    """Role check against the ONE existing permission matrix."""
++    from core.auth import _role_permissions
++
++    normalized = str(role or "").strip().lower()
++    if not normalized:
++        return False
++    try:
++        permissions = set(_role_permissions(normalized))
++    except Exception:  # noqa: BLE001 - unknown role never writes
++        return False
++    return "*" in permissions or WRITE_PERMISSION in permissions
++
++
++def _actor(actor: Any) -> dict[str, str]:
++    """Normalise the server-side actor. A customer can never act as staff."""
++    if not isinstance(actor, Mapping):
++        raise JourneyNoteDenied("Không xác định được người ghi.")
++    kind = _clean(actor.get("kind"), 20).lower()
++    if kind == "user":
++        username = _clean(actor.get("username"), 100)
++        role = _clean(actor.get("role"), 40).lower()
++        if not username:
++            raise JourneyNoteDenied("Không xác minh được tài khoản nội bộ.")
++        if not _user_may_write(role):
++            raise JourneyNoteDenied("Tài khoản này không được ghi trao đổi lô hàng.")
++        return {"kind": "user", "username": username, "role": role}
++    if kind == "customer":
++        customer_id = _clean(actor.get("customer_id"), 120)
++        if not customer_id:
++            raise JourneyNoteDenied("Không xác minh được khách hàng.")
++        return {
++            "kind": "customer",
++            "customer_id": customer_id,
++            "username": _clean(actor.get("name"), 100) or "Khách hàng",
++            "role": "customer",
++        }
++    raise JourneyNoteDenied("Không xác định được người ghi.")
++
++
++def _customer_read_allowed(actor: Mapping[str, str], customer_id: str) -> bool:
++    return actor.get("kind") != "customer" or actor.get("customer_id") == customer_id
++
++
++def _scope(database: Any, customer_id: str, shipment_id: str) -> None:
++    if not customer_id or not shipment_id:
++        raise JourneyNoteDenied("Thiếu khách hàng hoặc lô hàng hợp lệ.")
++    try:
++        customer = database.customers.find_one(
++            {"id": customer_id, "is_deleted": {"$ne": True}}, {"_id": 0, "id": 1},
++        )
++        shipment = database.shipments.find_one(
++            {"id": shipment_id, "is_deleted": {"$ne": True}},
++            {"_id": 0, "id": 1, "customer_id": 1},
++        )
++    except Exception:  # noqa: BLE001
++        LOGGER.warning("JOURNEY_NOTE_SCOPE_READ_FAILED")
++        raise JourneyNoteDenied("Không kiểm tra được lô hàng.") from None
++    if customer is None:
++        raise JourneyNoteDenied("Không tìm thấy hồ sơ khách hàng hợp lệ.")
++    if not isinstance(shipment, Mapping) or _clean(shipment.get("customer_id")) != customer_id:
++        raise JourneyNoteDenied("Lô hàng không thuộc khách hàng đã chọn.")
++
++
++def _public_note(row: Mapping[str, Any]) -> dict[str, Any]:
++    from core.inbox_attachments import project_inbox_attachment
++
++    attachments = [
++        projected
++        for projected in (
++            project_inbox_attachment(item)
++            for item in (row.get("attachments") or ())
++            if isinstance(item, Mapping)
++        )
++        if projected
++    ]
++    return {
++        "id": _clean(row.get("id"), 80),
++        "stage_id": _clean(row.get("stage_id"), 40),
++        "body": _clean(row.get("body"), MAX_BODY),
++        "visibility": (
++            VISIBILITY_CUSTOMER
++            if _clean(row.get("visibility"), 20).upper() == VISIBILITY_CUSTOMER
++            else VISIBILITY_INTERNAL
++        ),
++        "author_kind": _clean(row.get("author_kind"), 20) or "user",
++        "author_name": _clean(row.get("author_name"), 100),
++        "author_role": _clean(row.get("author_role"), 40),
++        "created_at": _clean(row.get("created_at"), 40),
++        "attachments": attachments,
++    }
++
++
++def list_stage_notes(
++    *,
++    customer_id: str,
++    shipment_id: str,
++    stage_id: str = "",
++    actor: Any = None,
++    db: Any = None,
++    limit: int = MAX_NOTES_READ,
++) -> list[dict[str, Any]]:
++    """Read one lot's stage discussion. Customers never receive internal notes."""
++    customer_id, shipment_id = _clean(customer_id, 120), _clean(shipment_id, 120)
++    stage = _clean(stage_id, 40).lower()
++    if stage and stage not in STAGE_IDS:
++        return []
++    if not customer_id or not shipment_id:
++        return []
++    database = _resolve_db(db)
++    resolved_actor = _actor(actor)
++    if not _customer_read_allowed(resolved_actor, customer_id):
++        LOGGER.warning("JOURNEY_NOTE_READ_DENIED reason=foreign_customer")
++        return []
++    query: dict[str, Any] = {
++        "kind": JOURNEY_NOTE_KIND,
++        "customer_id": customer_id,
++        "shipment_id": shipment_id,
++        "is_deleted": {"$ne": True},
++    }
++    if stage:
++        query["stage_id"] = stage
++    if resolved_actor.get("kind") == "customer":
++        query["visibility"] = VISIBILITY_CUSTOMER
++    try:
++        rows = list(
++            database[NOTE_COLLECTION].find(query, _PROJECTION)
++            .sort("created_at", 1)
++            .limit(max(1, min(int(limit or MAX_NOTES_READ), MAX_NOTES_READ)))
++        )
++    except Exception:  # noqa: BLE001
++        LOGGER.warning("JOURNEY_NOTE_READ_FAILED")
++        raise JourneyNoteDenied("Không đọc được trao đổi của lô hàng.") from None
++    notes = []
++    for row in rows:
++        if not isinstance(row, Mapping) or not _clean(row.get("id")):
++            continue
++        if _clean(row.get("customer_id")) != customer_id or _clean(row.get("shipment_id")) != shipment_id:
++            continue
++        notes.append(_public_note(row))
++    return notes
++
++
++def create_stage_note(
++    *,
++    customer_id: str,
++    shipment_id: str,
++    stage_id: str,
++    body: str,
++    visibility: str = VISIBILITY_INTERNAL,
++    actor: Any = None,
++    files: Sequence[Mapping[str, Any]] = (),
++    db: Any = None,
++    gridfs: Any = None,
++    drive: Any = None,
++    storage_backend: str | None = None,
++) -> dict[str, Any]:
++    """Append ONE note (with optional files) to one lot's stage thread.
++
++    Bytes are stored first; if the note cannot be proven written they are
++    compensated (one bounded delete). Nothing is reported as saved without a
++    fresh readback of the stored row.
++    """
++    resolved_actor = _actor(actor)
++    customer_id, shipment_id = _clean(customer_id, 120), _clean(shipment_id, 120)
++    stage = _clean(stage_id, 40).lower()
++    if stage not in STAGE_IDS:
++        raise JourneyNoteDenied("Công đoạn không hợp lệ.")
++    text = _clean(body, MAX_BODY).strip()
++    incoming = [item for item in (files or ()) if isinstance(item, Mapping)]
++    if len(incoming) > MAX_FILES_PER_SUBMIT:
++        raise JourneyNoteDenied(f"Tối đa {MAX_FILES_PER_SUBMIT} tệp mỗi lần gửi.")
++    if not text and not incoming:
++        raise JourneyNoteDenied("Nhập nội dung hoặc đính kèm chứng từ.")
++    requested = _clean(visibility, 20).upper() or VISIBILITY_INTERNAL
++    if requested not in VISIBILITIES:
++        raise JourneyNoteDenied("Phạm vi nội dung không hợp lệ.")
++    # A customer account can only ever publish customer-visible content.
++    final_visibility = (
++        VISIBILITY_CUSTOMER if resolved_actor["kind"] == "customer" else requested
++    )
++    database = _resolve_db(db)
++    _scope(database, customer_id, shipment_id)
++    if not _customer_read_allowed(resolved_actor, customer_id):
++        raise JourneyNoteDenied("Khách hàng không thể ghi vào lô của người khác.")
++
++    note_id = f"jn-{uuid4().hex}"
++    stored: list[dict[str, Any]] = []
++    attachments: list[dict[str, Any]] = []
++    backend_label = ""
++    if incoming:
++        from core.inbox_attachments import compensate_stored_bytes, store_inbox_bytes
++        from core.shipment_attachments import storage_label
++
++        for item in incoming:
++            outcome = store_inbox_bytes(
++                snippet_id=note_id,
++                file_name=_clean(item.get("name"), 255),
++                mime=_clean(item.get("mime"), 255),
++                data=item.get("data") or b"",
++                declared_size=item.get("size"),
++                uploaded_by=resolved_actor["username"],
++                drive=drive,
++                gridfs=gridfs,
++                storage_backend=storage_backend,
++            )
++            record = outcome.get("record") if isinstance(outcome, Mapping) else None
++            if not outcome.get("ok") or not isinstance(record, Mapping):
++                for orphan in stored:
++                    compensate_stored_bytes(
++                        client=orphan.get("client"),
++                        storage_file_id=str((orphan.get("record") or {}).get("storage_file_id") or ""),
++                    )
++                raise JourneyNoteDenied(
++                    _clean(outcome.get("error"), 300) or "Không lưu được chứng từ đính kèm."
++                )
++            stored.append(outcome)
++            attachments.append(dict(record))
++            backend_label = storage_label(outcome.get("backend"))
++
++    row = {
++        "id": note_id,
++        "kind": JOURNEY_NOTE_KIND,
++        "customer_id": customer_id,
++        "shipment_id": shipment_id,
++        "stage_id": stage,
++        "body": text,
++        "visibility": final_visibility,
++        "author_kind": resolved_actor["kind"],
++        "author_name": resolved_actor["username"],
++        "author_role": resolved_actor["role"],
++        "created_at": _now(),
++        "updated_at": _now(),
++        "updated_by": resolved_actor["username"],
++        "attachments": attachments,
++        "is_deleted": False,
++    }
++    try:
++        database[NOTE_COLLECTION].insert_one(dict(row))
++        saved = database[NOTE_COLLECTION].find_one(
++            {"id": note_id, "kind": JOURNEY_NOTE_KIND}, _PROJECTION,
++        )
++    except Exception:  # noqa: BLE001
++        LOGGER.warning("JOURNEY_NOTE_WRITE_FAILED type=unknown")
++        from core.inbox_attachments import compensate_stored_bytes
++
++        for orphan in stored:
++            compensate_stored_bytes(
++                client=orphan.get("client"),
++                storage_file_id=str((orphan.get("record") or {}).get("storage_file_id") or ""),
++            )
++        raise JourneyNoteDenied("Không lưu được trao đổi. Vui lòng thử lại.") from None
++    if not isinstance(saved, Mapping):
++        from core.inbox_attachments import compensate_stored_bytes
++
++        for orphan in stored:
++            compensate_stored_bytes(
++                client=orphan.get("client"),
++                storage_file_id=str((orphan.get("record") or {}).get("storage_file_id") or ""),
++            )
++        raise JourneyNoteDenied("Không xác nhận được trao đổi đã lưu. Vui lòng thử lại.")
++    LOGGER.info(
++        "JOURNEY_NOTE_SAVED shipment_id=%s stage=%s visibility=%s attachments=%s",
++        shipment_id, stage, final_visibility, len(attachments),
++    )
++    return {
++        "ok": True,
++        "note": _public_note(saved),
++        "storage_label": backend_label,
++        "visibility": final_visibility,
++    }
++
++
++def read_note_attachment(
++    *,
++    note_id: str,
++    attachment_id: str,
++    actor: Any = None,
++    db: Any = None,
++    gridfs: Any = None,
++    drive: Any = None,
++) -> dict[str, Any]:
++    """Read ONE attached file after re-proving the note and the exact file id.
++
++    A customer may only read files of customer-visible notes on their own lot.
++    """
++    resolved_actor = _actor(actor)
++    identifier, wanted = _clean(note_id, 80), _clean(attachment_id, 120)
++    if not identifier or not wanted:
++        return {"ok": False, "error": "Thiếu mã trao đổi hoặc mã tệp."}
++    database = _resolve_db(db)
++    try:
++        row = database[NOTE_COLLECTION].find_one(
++            {"id": identifier, "kind": JOURNEY_NOTE_KIND, "is_deleted": {"$ne": True}},
++            {"_id": 0},
++        )
++    except Exception:  # noqa: BLE001
++        LOGGER.warning("JOURNEY_NOTE_ATTACHMENT_READ_FAILED")
++        return {"ok": False, "error": "Không đọc được chứng từ."}
++    if not isinstance(row, Mapping):
++        return {"ok": False, "error": "Không tìm thấy chứng từ."}
++    if not _customer_read_allowed(resolved_actor, _clean(row.get("customer_id"), 120)):
++        LOGGER.warning("JOURNEY_NOTE_ATTACHMENT_DENIED reason=foreign_customer")
++        return {"ok": False, "error": "Không tìm thấy chứng từ."}
++    if (resolved_actor.get("kind") == "customer"
++            and _clean(row.get("visibility"), 20).upper() != VISIBILITY_CUSTOMER):
++        LOGGER.warning("JOURNEY_NOTE_ATTACHMENT_DENIED reason=internal_content")
++        return {"ok": False, "error": "Không tìm thấy chứng từ."}
++    record = next(
++        (
++            item
++            for item in (row.get("attachments") or ())
++            if isinstance(item, Mapping) and _clean(item.get("id"), 120) == wanted
++        ),
++        None,
++    )
++    if record is None:
++        return {"ok": False, "error": "Không tìm thấy chứng từ."}
++    from core.inbox_attachments import fetch_inbox_bytes
++
++    outcome = fetch_inbox_bytes(record, drive=drive, gridfs=gridfs)
++    if not outcome.get("ok"):
++        return {"ok": False, "error": _clean(outcome.get("error"), 300) or "Không đọc được chứng từ."}
++    return {
++        "ok": True,
++        "name": _clean(record.get("original_name") or record.get("stored_name"), 255),
++        "mime": _clean(record.get("mime"), 255),
++        "data": outcome.get("data") or b"",
++    }
+diff --git a/docs/NEXT.md b/docs/NEXT.md
+index 18f0598..a13f439 100644
+--- a/docs/NEXT.md
++++ b/docs/NEXT.md
+@@ -26,6 +26,8 @@ Xây **Logistics Work Desk có thể sử dụng thật**, tập trung giao di
+ 
+ ## CURRENT — phạm vi phát triển đang mở
+ 
++**Trao đổi + chứng từ theo công đoạn (đã có code, test và bằng chứng trên nhánh phụ thuộc PR #232):** `core/journey_notes.py` lưu trên `quick_notes` đang có (`kind=journey_note`), gắn `customer_id + shipment_id + stage_id`; `views/journey_discussion.py` render một luồng cho cả màn lô hàng Trường Thành và cổng khách hàng; tệp đi qua `core/inbox_attachments` (mặc định GridFS, Drive khi được cấu hình — không giả định Drive). Khách chỉ thấy nội dung `CUSTOMER` của lô mình, không thể tự nâng lên nội bộ. Test `tests/test_journey_notes.py` **31 PASS** + 3 đột biến đều FAIL; bằng chứng `evidence/journey-notes/README.md`. Full suite 34F/2178P, không lỗi mới so với baseline. **Chưa merge** (phụ thuộc PR #232 chưa được nghiệm thu trên staging; sandbox hiện tại không có quyền ghi/push lên repo này).
++
+ **G1.5 / PR #232 — kiểm chứng bản sửa chống thay đổi nội dung sau công bố, rồi review độc lập trên staging**, tái sử dụng nguồn và giao diện đang có. Phân biệt ba lớp nghiệm thu: (1) code/test với fixture; (2) tính đầy đủ, tính đúng của manifest/provenance nghiệp vụ được duyệt; (3) trải nghiệm khách hàng tại runtime thật. PASS lớp này không đồng nghĩa PASS lớp khác.
+ 
+ ## NEXT — bước có giá trị lớn nhất (một lát chức năng)
+@@ -66,4 +68,6 @@ Xây **Logistics Work Desk có thể sử dụng thật**, tập trung giao di
+ 
+ - **2026-10-30 (independent review PASS):** actor khác tác giả fix nghiệm thu HEAD `968e7cf` bằng focused suite + rerender Streamlit + đột biến; sửa 1 test hồi quy và thêm 29 challenge test. PR #232 đủ điều kiện tích hợp **staging**; `main`/production giữ nguyên, `CLOUD_QA=BLOCKED` (deployed SHA + DB identity chưa xác minh). Bắt đầu lát tiếp theo: **comment + chứng từ theo công đoạn Journey** trên nhánh phụ thuộc #232.
+ 
++- **2026-10-30 (trao đổi công đoạn):** hoàn thành lát comment + chứng từ theo công đoạn trên nhánh phụ thuộc #232: `core/journey_notes.py`, `views/journey_discussion.py`, `tests/test_journey_notes.py` (31 PASS, đột biến chứng minh), bằng chứng `evidence/journey-notes/README.md`. Full suite 34F/2178P. **Chưa merge**: chờ #232 được nghiệm thu + sandbox không có quyền push repo này (bản vá nằm ở nhánh session `7roger89-web/CHUNLI@arena/5bc30481-chunli`, thư mục `logi/`).
++
+ **Hướng dẫn duy trì:** Trước khi chọn task, so mục tiêu Owner + GoalPlan/TaskPlan với GitHub thực tế và checkpoint này. Chỉ cập nhật GOAL/CURRENT/NEXT/BLOCKERS và append **một dòng mốc có PR/SHA/bằng chứng** khi kết quả hoặc ưu tiên thực sự đổi. Không ghi nhật ký mỗi lệnh; không tự nhận đã cập nhật nếu chưa commit thành công.
+diff --git a/evidence/journey-notes/README.md b/evidence/journey-notes/README.md
+new file mode 100644
+index 0000000..ca442e8
+--- /dev/null
++++ b/evidence/journey-notes/README.md
+@@ -0,0 +1,72 @@
++# Trao đổi + chứng từ theo công đoạn lô hàng — bằng chứng
++
++Lát phát triển tiếp theo sau G1.5 (PR #232). Repository:
++`7roger89-web/logistics-work-desk-arena`. Nhánh làm việc:
++`arena/85dbc833-logistics-work-desk-arena` (phụ thuộc PR #232, **chưa merge**).
++
++## Phạm vi đã làm
++
++- `core/journey_notes.py` — một luồng trao đổi gắn **khách hàng + lô hàng +
++  công đoạn** (7 công đoạn `plan → finance`), lưu trong **collection
++  `quick_notes` đang có** với `kind="journey_note"`. Không tạo kho lưu trữ mới.
++- `views/journey_discussion.py` — cùng một composer/thread cho hai phía:
++  `render_internal_discussion` (màn lô hàng Trường Thành) và
++  `render_customer_discussion` (cổng khách hàng, dưới Journey Map).
++- Tệp đính kèm đi qua **`core/inbox_attachments`** → đúng adapter kho chứng từ
++  đang cấu hình (`ATTACHMENT_STORAGE_BACKEND`, mặc định **GridFS**;
++  `drive_shared`/`drive_oauth` khi được cấu hình). **Không giả định Google
++  Drive**: nếu kho chưa sẵn sàng, ghi bị từ chối và không lưu nửa vời.
++
++## Phân quyền
++
++| Hành động | Trường Thành | Lục Giác |
++| --- | --- | --- |
++| Đọc nội bộ (`INTERNAL`) | có (quyền `shipment_edit`) | **không bao giờ** |
++| Đọc nội dung `CUSTOMER` | có | chỉ lô của chính mình |
++| Ghi `INTERNAL` | có | bị ép thành `CUSTOMER` |
++| Ghi `CUSTOMER` | có | có, chỉ lô của mình (đối chiếu `shipments.customer_id`) |
++| Tải tệp đính kèm | có | chỉ tệp của note `CUSTOMER` trên lô của mình |
++
++Danh tính khách hàng do server quyết định (`portal_access_email` → `customers.id`);
++không có tham số `customer_id`/`shipment_id` từ trình duyệt ở phía cổng khách.
++
++## Kiểm thử (`tests/test_journey_notes.py`, 31 PASS)
++
++Runtime: Python 3.11.2, pytest 9.2.0, streamlit 1.66.1, mongomock 4.3.0. Kho
++bytes giả lập được inject, không chạm Cloud/production/dữ liệu thật.
++
++- lưu → đọc lại → reload nhiều lần vẫn đúng nội dung; đúng công đoạn, đúng lô;
++- note nội bộ không xuất hiện ở phía khách (cả khung nhìn lẫn AppTest thật);
++- khách ghi `INTERNAL` bị ép thành `CUSTOMER`; viewer/unknown/robot bị từ chối;
++- khách không ghi được vào lô khách khác; công đoạn sai/nội dung rỗng bị từ chối;
++- tệp: lưu qua kho giả lập, metadata trả về **không** lộ `storage_file_id`/`sha256`;
++  khách tải được tệp của note `CUSTOMER`, bị từ chối với note nội bộ và lô người khác;
++- kho chứng từ lỗi → **không** lưu note và bù xoá byte đã ghi; tệp sai định dạng/rỗng bị từ chối;
++- UI: pane nội bộ chạy trong **Streamlit thật** (`AppTest.from_string`) gửi được
++  note; cổng khách (app.py + OIDC giả lập) gửi, reload và hiển thị đúng;
++- thoát HTML: nội dung note chứa `<script>` được escape trước khi render.
++
++**Đột biến (chứng minh test không rỗng)** — mỗi đột biến làm đúng test tương ứng FAIL:
++1. bỏ lọc `visibility` khi khách đọc → 2 FAIL;
++2. không ép `CUSTOMER` khi khách ghi + bỏ chặn đọc khác khách → 2 FAIL;
++3. bỏ chặn ghi/tải chéo khách và tải nội bộ → 2 FAIL.
++
++## Full suite (cùng lệnh, cùng môi trường)
++
++`python -m pytest tests -q --continue-on-collection-errors -p no:cacheprovider`
++
++| HEAD | Kết quả |
++| --- | --- |
++| PR #232 gốc `968e7cf` | 38 failed / 2115 passed / 45 skipped |
++| + review G1.5 | 35 failed / 2148 passed / 44 skipped |
++| + trao đổi công đoạn | **34 failed / 2178 passed / 44 skipped** |
++
++Không có lỗi mới so với baseline; tập lỗi nền (34) không đổi.
++
++## Giới hạn trung thực
++
++- Chưa chạy trên Cloud/Streamlit thật với Google OIDC và Mongo thật:
++  `CLOUD_QA=BLOCKED` (deployed SHA và DB identity chưa xác minh).
++- Chưa nối vào `stage_comments`/`stage_documents` của Journey Map trong
++  component React: phần trao đổi hiển thị bằng widget Streamlit ngay dưới bản đồ.
++- Chưa có nguồn sự kiện/chứng từ thật được nghiệp vụ duyệt: dữ liệu thử là giả lập.
+diff --git a/tests/test_journey_notes.py b/tests/test_journey_notes.py
+new file mode 100644
+index 0000000..60b68dc
+--- /dev/null
++++ b/tests/test_journey_notes.py
+@@ -0,0 +1,543 @@
++"""Trao đổi theo công đoạn (Trường Thành ↔ một khách hàng) — isolated tests.
++
++Everything runs on mongomock plus a fake byte store. No Cloud, no production,
++no real Google Drive: the storage backend is injected per test.
++"""
++from __future__ import annotations
++
++import base64
++import contextlib
++import json
++import time
++from pathlib import Path
++from unittest.mock import patch
++
++import mongomock
++import pytest
++from streamlit.testing.v1 import AppTest
++
++from core import journey_notes as notes
++from views import journey_discussion as discussion
++
++ROOT = Path(__file__).resolve().parents[1]
++APP_PATH = ROOT / "app.py"
++
++CUSTOMER_A = "CUST-LUCGIAC"
++CUSTOMER_B = "CUST-MINHDUC"
++EMAIL_A = "portal.lucgiac@example.com"
++LOT_A = "G1-LG-001"
++LOT_B = "G1-MD-001"
++
++SALE = {"kind": "user", "username": "sale.thanh", "role": "sale"}
++SUPPORT = {"kind": "user", "username": "support.ha", "role": "support"}
++VIEWER = {"kind": "user", "username": "xem.thu", "role": "viewer"}
++CUSTOMER_ACTOR = {"kind": "customer", "customer_id": CUSTOMER_A, "name": "Lục Giác"}
++FOREIGN_ACTOR = {"kind": "customer", "customer_id": CUSTOMER_B, "name": "Minh Đức"}
++
++PNG_1PX = base64.b64decode(
++    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8Dw"
++    "HwAFAAH/q842iQAAAABJRU5ErkJggg=="
++)
++
++FAKE_AUTH = {
++    "required": True,
++    "redirect_uri": "http://localhost:8501/oauth2callback",
++    "cookie_secret": "S" * 48,
++    "google": {
++        "client_id": "staging-client-id.apps.googleusercontent.com",
++        "client_secret": "STAGING_TEST_ONLY_CLIENT_SECRET",
++        "server_metadata_url": "https://accounts.google.com/.well-known/openid-configuration",
++    },
++}
++
++
++class FakeStore:
++    """Smallest injectable byte store standing in for GridFS/Drive."""
++
++    def __init__(self, *, fail: bool = False):
++        self.files: dict[str, bytes] = {}
++        self.deleted: list[str] = []
++        self.fail = fail
++        self.counter = 0
++
++    def upload_file(self, *, name: str, mime: str, data: bytes, metadata=None):
++        if self.fail:
++            raise RuntimeError("STORE_DOWN")
++        self.counter += 1
++        file_id = f"fs-{self.counter}"
++        self.files[file_id] = bytes(data)
++        return {"storage_file_id": file_id, "stored_name": name, "stored_size": len(data)}
++
++    def download_file(self, file_id: str):
++        if file_id not in self.files:
++            raise KeyError(file_id)
++        return self.files[file_id]
++
++    def delete_file(self, file_id: str):
++        self.deleted.append(file_id)
++        return self.files.pop(file_id, None) is not None
++
++
++@pytest.fixture
++def db():
++    database = mongomock.MongoClient()["journey_notes_test"]
++    database.customers.insert_many([
++        {"id": CUSTOMER_A, "name": "Lục Giác", "portal_access_email": EMAIL_A},
++        {"id": CUSTOMER_B, "name": "Minh Đức"},
++    ])
++    database.shipments.insert_many([
++        {"id": LOT_A, "customer_id": CUSTOMER_A, "transport_mode": "SEA"},
++        {"id": LOT_B, "customer_id": CUSTOMER_B, "transport_mode": "ROAD"},
++    ])
++    return database
++
++
++@pytest.fixture
++def store():
++    return FakeStore()
++
++
++def _write(db, *, body="Kiểm tra chứng từ", stage="customs", visibility=notes.VISIBILITY_CUSTOMER,
++           actor=SALE, files=(), store=None, lot=LOT_A, customer=CUSTOMER_A):
++    return notes.create_stage_note(
++        customer_id=customer, shipment_id=lot, stage_id=stage, body=body,
++        visibility=visibility, actor=actor, files=files, db=db, gridfs=store,
++        storage_backend="gridfs",
++    )
++
++
++def _internal(db, stage=""):
++    return notes.list_stage_notes(
++        customer_id=CUSTOMER_A, shipment_id=LOT_A, stage_id=stage, actor=SALE, db=db)
++
++
++def _customer(db, stage="", actor=CUSTOMER_ACTOR):
++    return notes.list_stage_notes(
++        customer_id=CUSTOMER_A, shipment_id=LOT_A, stage_id=stage, actor=actor, db=db)
++
++
++# --------------------------------------------------------------------------
++# Write permissions and scoping
++# --------------------------------------------------------------------------
++
++def test_internal_note_is_saved_readable_and_hidden_from_customer(db):
++    _write(db, body="Ghi chú nội bộ: chưa chốt giá", visibility=notes.VISIBILITY_INTERNAL)
++    thread = _internal(db)
++    assert len(thread) == 1
++    assert thread[0]["body"] == "Ghi chú nội bộ: chưa chốt giá"
++    assert thread[0]["visibility"] == notes.VISIBILITY_INTERNAL
++    assert thread[0]["author_name"] == "sale.thanh"
++    assert _customer(db) == []
++
++
++def test_customer_visible_note_reaches_both_sides(db):
++    _write(db, body="Cần bổ sung packing list", visibility=notes.VISIBILITY_CUSTOMER)
++    assert [row["body"] for row in _customer(db)] == ["Cần bổ sung packing list"]
++    assert len(_internal(db)) == 1
++
++
++def test_customer_write_is_forced_to_customer_visibility(db):
++    _write(db, body="Khách xác nhận địa chỉ", actor=CUSTOMER_ACTOR,
++           visibility=notes.VISIBILITY_INTERNAL)
++    row = _internal(db)[0]
++    assert row["visibility"] == notes.VISIBILITY_CUSTOMER
++    assert row["author_kind"] == "customer"
++
++
++@pytest.mark.parametrize("actor", [VIEWER, {"kind": "user", "username": "x", "role": "unknown"},
++                                   {"kind": "user", "username": "", "role": "admin"},
++                                   {"kind": "robot"}, None, "admin"])
++def test_write_is_refused_without_permission(db, actor):
++    with pytest.raises(notes.JourneyNoteDenied):
++        _write(db, actor=actor)
++    assert db.quick_notes.count_documents({"kind": notes.JOURNEY_NOTE_KIND}) == 0
++
++
++@pytest.mark.parametrize("actor", [SALE, SUPPORT, {"kind": "user", "username": "a", "role": "admin"}])
++def test_roles_with_shipment_edit_may_write(db, actor):
++    assert _write(db, actor=actor)["ok"] is True
++
++
++def test_customer_cannot_write_to_another_customers_lot(db):
++    with pytest.raises(notes.JourneyNoteDenied):
++        _write(db, actor=FOREIGN_ACTOR, lot=LOT_A)
++    with pytest.raises(notes.JourneyNoteDenied):
++        _write(db, actor=CUSTOMER_ACTOR, lot=LOT_B, customer=CUSTOMER_B)
++    assert db.quick_notes.count_documents({"kind": notes.JOURNEY_NOTE_KIND}) == 0
++
++
++def test_unknown_stage_empty_body_and_foreign_lot_are_refused(db):
++    with pytest.raises(notes.JourneyNoteDenied):
++        _write(db, stage="space")
++    with pytest.raises(notes.JourneyNoteDenied):
++        _write(db, body="   ")
++    with pytest.raises(notes.JourneyNoteDenied):
++        _write(db, lot="NO-SUCH-LOT")
++    assert db.quick_notes.count_documents({"kind": notes.JOURNEY_NOTE_KIND}) == 0
++
++
++# --------------------------------------------------------------------------
++# Read scoping: stage, lot, tenant, reload
++# --------------------------------------------------------------------------
++
++def test_notes_are_scoped_to_one_stage_and_one_lot(db):
++    _write(db, body="Mốc lấy hàng", stage="pickup")
++    _write(db, body="Mốc thông quan", stage="customs")
++    _write(db, body="Lô khác", stage="pickup", lot=LOT_B, customer=CUSTOMER_B)
++    assert [row["body"] for row in _internal(db, stage="pickup")] == ["Mốc lấy hàng"]
++    assert [row["body"] for row in _internal(db, stage="customs")] == ["Mốc thông quan"]
++    assert len(_internal(db)) == 2
++    assert "Lô khác" not in json.dumps(_internal(db), ensure_ascii=False)
++
++
++def test_other_customer_reads_nothing_from_this_lot(db):
++    _write(db, visibility=notes.VISIBILITY_CUSTOMER)
++    assert _customer(db, actor=FOREIGN_ACTOR) == []
++    assert notes.list_stage_notes(
++        customer_id=CUSTOMER_B, shipment_id=LOT_B, actor=FOREIGN_ACTOR, db=db) == []
++
++
++def test_notes_survive_a_reload(db):
++    _write(db, body="Nội dung sau reload", visibility=notes.VISIBILITY_CUSTOMER)
++    for _ in range(3):
++        assert [row["body"] for row in _customer(db)] == ["Nội dung sau reload"]
++    stored = db.quick_notes.find_one({"kind": notes.JOURNEY_NOTE_KIND})
++    assert stored["customer_id"] == CUSTOMER_A and stored["shipment_id"] == LOT_A
++
++
++def test_legacy_quick_notes_are_never_returned(db):
++    db.quick_notes.insert_many([
++        {"id": "team_note", "content": "Sổ tay đội"},
++        {"id": "note-1", "kind": "inbox_snippet", "raw_text": "Mẩu tin hộp thư đến",
++         "shipment_ids": [LOT_A]},
++    ])
++    assert _internal(db) == []
++    assert _customer(db) == []
++
++
++# --------------------------------------------------------------------------
++# Attachments: real byte store injected, no storage ids leak
++# --------------------------------------------------------------------------
++
++def _png(name="bang-ke.png"):
++    return {"name": name, "mime": "image/png", "data": PNG_1PX, "size": len(PNG_1PX)}
++
++
++def test_attachment_is_stored_listed_and_downloadable_by_staff(db, store):
++    outcome = _write(db, body="Đã gửi ảnh tờ khai", files=[_png()], store=store)
++    assert outcome["ok"] is True
++    row = _internal(db)[0]
++    assert len(row["attachments"]) == 1
++    attachment = row["attachments"][0]
++    assert attachment["name"] == "bang-ke.png"
++    serialized = json.dumps(row)
++    assert "storage_file_id" not in serialized and "sha256" not in serialized
++    read = notes.read_note_attachment(
++        note_id=row["id"], attachment_id=attachment["id"], actor=SALE, db=db, gridfs=store)
++    assert read["ok"] is True and read["data"] == PNG_1PX
++
++
++def test_customer_may_read_only_visible_attachments(db, store):
++    _write(db, body="Ảnh nội bộ", visibility=notes.VISIBILITY_INTERNAL, files=[_png("noi-bo.png")],
++           store=store)
++    _write(db, body="Ảnh cho khách", visibility=notes.VISIBILITY_CUSTOMER,
++           files=[_png("cho-khach.png")], store=store)
++    visible = [row for row in _customer(db) if row["attachments"]]
++    assert len(visible) == 1
++    attachment = visible[0]["attachments"][0]
++    assert attachment["name"] == "cho-khach.png"
++    read = notes.read_note_attachment(
++        note_id=visible[0]["id"], attachment_id=attachment["id"],
++        actor=CUSTOMER_ACTOR, db=db, gridfs=store)
++    assert read["ok"] is True
++    internal_row = next(row for row in _internal(db) if row["visibility"] == notes.VISIBILITY_INTERNAL)
++    denied = notes.read_note_attachment(
++        note_id=internal_row["id"], attachment_id=internal_row["attachments"][0]["id"],
++        actor=CUSTOMER_ACTOR, db=db, gridfs=store)
++    assert denied["ok"] is False and denied.get("data", b"") == b""
++    foreign = notes.read_note_attachment(
++        note_id=visible[0]["id"], attachment_id=attachment["id"],
++        actor=FOREIGN_ACTOR, db=db, gridfs=store)
++    assert foreign["ok"] is False
++
++
++def test_storage_failure_leaves_no_note_and_compensates_bytes(db):
++    broken = FakeStore(fail=True)
++    with pytest.raises(notes.JourneyNoteDenied):
++        _write(db, body="Kèm tệp", files=[_png()], store=broken)
++    assert db.quick_notes.count_documents({"kind": notes.JOURNEY_NOTE_KIND}) == 0
++
++
++def test_unsupported_or_empty_file_is_refused(db, store):
++    with pytest.raises(notes.JourneyNoteDenied):
++        _write(db, files=[{"name": "malware.exe", "mime": "application/octet-stream",
++                           "data": b"MZ", "size": 2}], store=store)
++    with pytest.raises(notes.JourneyNoteDenied):
++        _write(db, files=[{"name": "empty.png", "mime": "image/png", "data": b"", "size": 0}],
++               store=store)
++    assert store.files == {}
++    assert db.quick_notes.count_documents({"kind": notes.JOURNEY_NOTE_KIND}) == 0
++
++
++# --------------------------------------------------------------------------
++# Internal UI (mocked Streamlit) and customer portal (real Streamlit AppTest)
++# --------------------------------------------------------------------------
++
++class FakeStreamlit:
++    """Minimal recorder standing in for the Streamlit surface used here."""
++
++    def __init__(self, *, body="", visibility_index=0, uploads=(), send=False, download=False,
++                 stage_index=0):
++        self.session_state = {}
++        self.markdowns: list[str] = []
++        self.captions: list[str] = []
++        self.errors: list[str] = []
++        self.successes: list[str] = []
++        self.downloads: list[dict] = []
++        self.body = body
++        self.visibility_index = visibility_index
++        self.uploads = uploads
++        self.send = send
++        self.download = download
++        self.stage_index = stage_index
++
++    def expander(self, *args, **kwargs):
++        return contextlib.nullcontext()
++
++    def selectbox(self, label, options, index=0, key=None, **kwargs):
++        return options[self.stage_index]
++
++    def radio(self, label, options, index=0, **kwargs):
++        return options[self.visibility_index]
++
++    def text_area(self, label, key=None, **kwargs):
++        return self.body
++
++    def file_uploader(self, *args, **kwargs):
++        return list(self.uploads)
++
++    def button(self, label, key=None, **kwargs):
++        if label == "Gửi":
++            return self.send
++        return self.download
++
++    def download_button(self, label, data=b"", file_name="", mime="", key=None, **kwargs):
++        self.downloads.append({"file_name": file_name, "size": len(data or b"")})
++
++    def markdown(self, text, **kwargs):
++        self.markdowns.append(str(text))
++
++    def caption(self, text, **kwargs):
++        self.captions.append(str(text))
++
++    def divider(self):
++        return None
++
++    def error(self, text, **kwargs):
++        self.errors.append(str(text))
++
++    def warning(self, text, **kwargs):
++        self.errors.append(str(text))
++
++    def success(self, text, **kwargs):
++        self.successes.append(str(text))
++
++
++def _run_internal(db, store=None, **kwargs):
++    fake = FakeStreamlit(**kwargs)
++    with (
++        patch.object(discussion, "st", fake),
++        patch("core.inbox_attachments._resolve_gridfs", return_value=store or FakeStore()),
++    ):
++        discussion.render_internal_discussion(LOT_A, CUSTOMER_A, SALE, db=db)
++    return fake
++
++
++def test_internal_ui_shows_both_visibilities_and_can_post(db):
++    _write(db, body="Nội bộ: giữ xe", visibility=notes.VISIBILITY_INTERNAL, stage="pickup")
++    _write(db, body="Khách: chờ xác nhận", visibility=notes.VISIBILITY_CUSTOMER, stage="pickup")
++    fake = _run_internal(db, stage_index=1)
++    text = "\n".join(fake.markdowns)
++    assert "Nội bộ: giữ xe" in text and "Khách: chờ xác nhận" in text
++    assert "Nội bộ Trường Thành" in text and "Khách hàng nhìn thấy" in text
++
++
++def test_note_text_is_escaped_before_rendering(db):
++    _write(db, body="<script>alert(1)</script> & <b>chào</b>", stage="customs",
++           visibility=notes.VISIBILITY_CUSTOMER)
++    fake = _run_internal(db, stage_index=4)
++    text = "\n".join(fake.markdowns)
++    assert "<script>" not in text and "&lt;script&gt;" in text
++    assert "<b>chào</b>" not in text
++
++
++def test_internal_ui_posts_a_note(db):
++    fake = _run_internal(db, stage_index=4, body="Chờ khách bổ sung C/O", send=True)
++    assert fake.successes and not fake.errors
++    rows = _internal(db, stage="customs")
++    assert [row["body"] for row in rows] == ["Chờ khách bổ sung C/O"]
++    assert rows[0]["visibility"] == notes.VISIBILITY_INTERNAL
++
++
++def test_internal_ui_can_publish_a_customer_visible_note(db):
++    fake = _run_internal(db, stage_index=4, body="Vui lòng xác nhận", send=True,
++                         visibility_index=1)
++    assert fake.successes
++    rows = _internal(db, stage="customs")
++    assert rows[0]["visibility"] == notes.VISIBILITY_CUSTOMER
++    assert [row["body"] for row in _customer(db, stage="customs")] == ["Vui lòng xác nhận"]
++
++
++def test_internal_ui_reports_errors_without_writing(db):
++    fake = _run_internal(db, stage_index=0, body="   ", send=True)
++    assert fake.errors and not fake.successes
++    assert db.quick_notes.count_documents({"kind": notes.JOURNEY_NOTE_KIND}) == 0
++
++
++def test_internal_ui_download_requires_the_exact_attachment(db, store):
++    _write(db, body="Ảnh tờ khai", stage="customs", files=[_png()], store=store)
++    row = _internal(db)[0]
++    fake = _run_internal(db, store=store, stage_index=4, download=True)
++    assert fake.downloads and fake.downloads[0]["size"] == len(PNG_1PX)
++    # A stale id from another note is refused.
++    assert notes.read_note_attachment(
++        note_id=row["id"], attachment_id="att-does-not-exist", actor=SALE, db=db,
++        gridfs=store)["ok"] is False
++
++
++def _claims(email: str):
++    return {
++        "is_logged_in": True, "provider": "google", "aud": FAKE_AUTH["google"]["client_id"],
++        "iss": "https://accounts.google.com", "email": email, "email_verified": True,
++        "exp": int(time.time()) + 600, "sub": "staging-google-subject",
++    }
++
++
++def _portal(db, email=EMAIL_A):
++    from core import customer_portal as portal
++    from core.customer_portal_publish import publish_verified_sources
++
++    app = AppTest.from_file(str(APP_PATH), default_timeout=120)
++    app.secrets = {"auth": FAKE_AUTH}
++    with (
++        patch("streamlit.user_info._get_user_info", return_value=_claims(email)),
++        patch.object(portal, "get_db", return_value=db),
++        patch("core.database.get_db", return_value=db),
++        patch("core.journey_notes._resolve_db", return_value=db),
++    ):
++        app.run()
++    return app
++
++
++def _visible(app):
++    values = []
++    for name in ("markdown", "caption", "text", "success", "error", "warning", "info"):
++        for element in getattr(app, name, []):
++            values.append(str(getattr(element, "value", "")))
++            label = getattr(element, "label", None)
++            if label:
++                values.append(str(label))
++    return "\n".join(values)
++
++
++def test_internal_pane_runs_in_a_real_streamlit_script(db):
++    """The same pane through the real Streamlit runtime, not only the fake."""
++    script = (
++        "import streamlit as st\n"
++        "from views.journey_discussion import render_internal_discussion\n"
++        f"render_internal_discussion('{LOT_A}', '{CUSTOMER_A}', "
++        "{'username': 'sale.thanh', 'role': 'sale'})\n"
++    )
++    app = AppTest.from_string(script, default_timeout=120)
++    with (
++        patch("core.database.get_db", return_value=db),
++        patch("core.inbox_attachments._resolve_gridfs", return_value=FakeStore()),
++    ):
++        app.run()
++        assert not app.exception, [str(e.value) for e in app.exception]
++        areas = list(app.text_area)
++        assert areas and areas[0].label == "Nội dung trao đổi"
++        areas[0].set_value("Chốt xe tải 8 tấn")
++        senders = [element for element in app.button if element.label == "Gửi"]
++        assert senders
++        senders[0].click()
++        app.run()
++        assert not app.exception, [str(e.value) for e in app.exception]
++        assert "Đã lưu trao đổi" in _visible(app)
++    rows = notes.list_stage_notes(
++        customer_id=CUSTOMER_A, shipment_id=LOT_A, actor=SALE, db=db)
++    assert [row["body"] for row in rows] == ["Chốt xe tải 8 tấn"]
++
++
++def test_customer_portal_posts_and_reloads_a_stage_comment(db):
++    from core import customer_portal as portal
++    from core.customer_portal_publish import publish_verified_sources
++
++    db.public_events.insert_one({
++        "id": "EV-1", "version": "v1", "customer_id": CUSTOMER_A, "shipment_id": LOT_A,
++        "stage_id": "pickup", "public_title": "Đã lấy hàng",
++        "occurred_at": "2026-10-28T01:00:00Z", "verified": True,
++        "verified_at": "2026-10-28T02:00:00Z", "visibility": "CUSTOMER",
++    })
++    ok, message = publish_verified_sources(
++        CUSTOMER_A, LOT_A, event_versions={"EV-1": "v1"}, document_versions={},
++        expected_current_version="", actor_role="admin", actor_username="staging-admin", db=db)
++    assert ok, message
++
++    app = AppTest.from_file(str(APP_PATH), default_timeout=120)
++    app.secrets = {"auth": FAKE_AUTH}
++    with (
++        patch("streamlit.user_info._get_user_info", return_value=_claims(EMAIL_A)),
++        patch.object(portal, "get_db", return_value=db),
++        patch("core.database.get_db", return_value=db),
++    ):
++        app.run()
++        assert not app.exception, [str(e.value) for e in app.exception]
++        areas = [element for element in app.text_area]
++        assert areas, "không thấy ô nhập trao đổi trên cổng khách hàng"
++        areas[0].set_value("Xác nhận địa chỉ giao hàng")
++        senders = [element for element in app.button if element.label == "Gửi"]
++        assert senders, "không thấy nút gửi trao đổi"
++        senders[0].click()
++        app.run()          # writes the note
++        assert not app.exception, [str(e.value) for e in app.exception]
++        assert "Đã lưu trao đổi" in _visible(app)
++        app.run()          # reloads and renders the saved note
++        assert not app.exception, [str(e.value) for e in app.exception]
++        visible = _visible(app)
++
++    rows = notes.list_stage_notes(
++        customer_id=CUSTOMER_A, shipment_id=LOT_A, actor=CUSTOMER_ACTOR, db=db)
++    assert [row["body"] for row in rows] == ["Xác nhận địa chỉ giao hàng"]
++    assert rows[0]["visibility"] == notes.VISIBILITY_CUSTOMER
++    assert "Xác nhận địa chỉ giao hàng" in visible
++
++
++def test_customer_portal_never_shows_internal_notes(db):
++    from core import customer_portal as portal
++    from core.customer_portal_publish import publish_verified_sources
++
++    db.public_events.insert_one({
++        "id": "EV-1", "version": "v1", "customer_id": CUSTOMER_A, "shipment_id": LOT_A,
++        "stage_id": "pickup", "public_title": "Đã lấy hàng",
++        "occurred_at": "2026-10-28T01:00:00Z", "verified": True,
++        "verified_at": "2026-10-28T02:00:00Z", "visibility": "CUSTOMER",
++    })
++    ok, _ = publish_verified_sources(
++        CUSTOMER_A, LOT_A, event_versions={"EV-1": "v1"}, document_versions={},
++        expected_current_version="", actor_role="admin", actor_username="staging-admin", db=db)
++    assert ok
++    _write(db, body="NỘI TỐI MẬT GIÁ VỐN", visibility=notes.VISIBILITY_INTERNAL, stage="pickup")
++
++    app = AppTest.from_file(str(APP_PATH), default_timeout=120)
++    app.secrets = {"auth": FAKE_AUTH}
++    with (
++        patch("streamlit.user_info._get_user_info", return_value=_claims(EMAIL_A)),
++        patch.object(portal, "get_db", return_value=db),
++        patch("core.database.get_db", return_value=db),
++    ):
++        app.run()
++        assert not app.exception, [str(e.value) for e in app.exception]
++        visible = _visible(app)
++    assert "NỘI TỐI MẬT GIÁ VỐN" not in visible
++    assert "Nội bộ Trường Thành" not in visible
+diff --git a/views/customer_dashboard.py b/views/customer_dashboard.py
+index ad3a030..3e184ad 100644
+--- a/views/customer_dashboard.py
++++ b/views/customer_dashboard.py
+@@ -189,6 +189,15 @@ def render_customer_dashboard(
+             "Không có dữ liệu nào được hiển thị."
+         )
+ 
++    # Trao đổi theo công đoạn: chỉ lô của chính khách này, chỉ nội dung đã cho
++    # phép, cùng luồng với màn hình lô hàng của Trường Thành.
++    try:
++        from views.journey_discussion import render_customer_discussion
++
++        render_customer_discussion(view.cards, principal, db=db)
++    except Exception as exc:  # noqa: BLE001 - never take the portal down
++        st.caption(f"Không tải được trao đổi công đoạn ({type(exc).__name__}).")
++
+ 
+ def render_owner_portal_access_control(
+     user: Mapping[str, Any],
+diff --git a/views/journey_discussion.py b/views/journey_discussion.py
+new file mode 100644
+index 0000000..e720453
+--- /dev/null
++++ b/views/journey_discussion.py
+@@ -0,0 +1,221 @@
++"""Trao đổi theo công đoạn — cùng một luồng cho Trường Thành và cổng khách.
++
++Hai hàm render dùng chung một backend (:mod:`core.journey_notes`) và chung một
++kho chứng từ hiện có (GridFS/Drive đã cấu hình). Không có widget nào nhận
++``customer_id`` hay ``shipment_id`` từ trình duyệt: phía khách chỉ dùng danh
++tính đã được server chứng minh, phía nội bộ dùng lô đang mở.
++"""
++from __future__ import annotations
++
++import html as html_lib
++from typing import Any, Mapping, Sequence
++
++import streamlit as st
++
++from core import journey_notes as notes
++
++_STAGE_OPTIONS = tuple(zip(notes.STAGE_IDS, (notes.STAGE_LABELS[s] for s in notes.STAGE_IDS)))
++
++
++def _text(value: Any, limit: int = 0) -> str:
++    if value in (None, "") or isinstance(value, bool):
++        return ""
++    text = str(value).strip()
++    return text[:limit] if limit else text
++
++
++def _escape(value: str) -> str:
++    return html_lib.escape(str(value), quote=False)
++
++
++def _stage_label(stage_id: str) -> str:
++    return notes.STAGE_LABELS.get(_text(stage_id), _text(stage_id) or "Công đoạn")
++
++
++def _stage_choice(label: str, key: str, *, index: int = 0) -> str:
++    options = [f"{i:02d} · {name}" for i, (_, name) in enumerate(_STAGE_OPTIONS)]
++    safe_index = max(0, min(int(index or 0), len(options) - 1))
++    picked = st.selectbox(label, options, index=safe_index, key=key)
++    return notes.STAGE_IDS[options.index(picked)] if picked in options else notes.STAGE_IDS[0]
++
++
++def _attachment_rows(note: Mapping[str, Any]) -> list[dict[str, Any]]:
++    return [row for row in (note.get("attachments") or ()) if isinstance(row, Mapping)]
++
++
++def _render_thread(thread: Sequence[Mapping[str, Any]], *, key_prefix: str, db: Any,
++                   actor: Mapping[str, str]) -> None:
++    if not thread:
++        st.caption("Chưa có trao đổi nào ở công đoạn này.")
++        return
++    for note in thread:
++        internal = _text(note.get("visibility"), 20).upper() == notes.VISIBILITY_INTERNAL
++        badge = "🔒 Nội bộ Trường Thành" if internal else "👁 Khách hàng nhìn thấy"
++        who = _escape(_text(note.get("author_name"), 60) or "—")
++        kind = "Khách hàng" if _text(note.get("author_kind"), 20) == "customer" else "Trường Thành"
++        stamp = _escape(_text(note.get("created_at"), 40).replace("T", " ")[:19])
++        # The body is operator/customer text: escape it before any HTML render.
++        body = _escape(_text(note.get("body"), notes.MAX_BODY))
++        st.markdown(
++            f"**{who}** · {kind} · {stamp}  \n"
++            f"<span style='font-size:11px;color:#64748B'>{badge}</span>\n\n"
++            f"<div style='white-space:pre-wrap'>{body}</div>",
++            unsafe_allow_html=True,
++        )
++        for row in _attachment_rows(note):
++            label = f"📎 {_text(row.get('name'), 160)} · {_text(row.get('sizeLabel'), 40)}"
++            if st.button(label, key=f"{key_prefix}_dl_{_text(row.get('id'), 80)}"):
++                outcome = notes.read_note_attachment(
++                    note_id=_text(note.get("id"), 80),
++                    attachment_id=_text(row.get("id"), 120),
++                    actor=actor,
++                    db=db,
++                )
++                if outcome.get("ok"):
++                    st.download_button(
++                        "⬇️ Tải xuống",
++                        data=outcome.get("data") or b"",
++                        file_name=outcome.get("name") or "chung-tu",
++                        mime=outcome.get("mime") or "application/octet-stream",
++                        key=f"{key_prefix}_save_{_text(row.get('id'), 80)}",
++                    )
++                else:
++                    st.warning(_text(outcome.get("error"), 200) or "Không đọc được chứng từ.")
++        st.divider()
++
++
++def _composer(*, key_prefix: str, db: Any, actor: Mapping[str, str], customer_id: str,
++              shipment_id: str, stage_id: str, visibility_options: Sequence[str],
++              default_visibility: str, help_text: str) -> None:
++    # The composer is keyed by a send counter so a saved note clears the box on
++    # the next rerun without mutating a live widget's session-state key.
++    seq_key = f"{key_prefix}_seq"
++    try:
++        seq = int(st.session_state.get(seq_key) or 0)
++    except (TypeError, ValueError):
++        seq = 0
++    body = st.text_area(
++        "Nội dung trao đổi", key=f"{key_prefix}_body_{seq}", height=90,
++        placeholder=help_text,
++    )
++    visibility = default_visibility
++    if len(visibility_options) > 1:
++        visibility = st.radio(
++            "Ai nhìn thấy nội dung này?", list(visibility_options),
++            index=list(visibility_options).index(default_visibility),
++            horizontal=True, key=f"{key_prefix}_vis",
++        )
++    visibility_value = (
++        notes.VISIBILITY_CUSTOMER if visibility.startswith("👁") else notes.VISIBILITY_INTERNAL
++    )
++    uploads = st.file_uploader(
++        "Đính chứng từ (tùy chọn)",
++        type=None,
++        accept_multiple_files=True,
++        key=f"{key_prefix}_files",
++    )
++    if not st.button("Gửi", key=f"{key_prefix}_send"):
++        return
++    files: list[dict[str, Any]] = []
++    for upload in (uploads or [])[: notes.MAX_FILES_PER_SUBMIT]:
++        files.append({
++            "name": getattr(upload, "name", ""),
++            "mime": getattr(upload, "type", "") or "",
++            "data": upload.getvalue(),
++            "size": getattr(upload, "size", None),
++        })
++    try:
++        outcome = notes.create_stage_note(
++            customer_id=customer_id,
++            shipment_id=shipment_id,
++            stage_id=stage_id,
++            body=body or "",
++            visibility=visibility_value,
++            actor=actor,
++            files=files,
++            db=db,
++        )
++    except notes.JourneyNoteDenied as denied:
++        st.error(_text(denied, 300) or "Không gửi được trao đổi.")
++        return
++    st.session_state[seq_key] = seq + 1
++    st.success("Đã lưu trao đổi tại công đoạn này.")
++
++
++def render_internal_discussion(
++    shipment_id: str,
++    customer_id: str,
++    user: Mapping[str, Any],
++    *,
++    db: Any = None,
++    key_prefix: str = "jd_internal",
++) -> None:
++    """Trường Thành: đọc + ghi toàn bộ luồng (cả nội bộ lẫn khách nhìn thấy)."""
++    shipment = _text(shipment_id, 120)
++    customer = _text(customer_id, 120)
++    if not shipment or not customer:
++        st.caption("Chưa xác định được khách hàng của lô này để trao đổi.")
++        return
++    actor = {
++        "kind": "user",
++        "username": _text(user.get("username"), 100),
++        "role": _text(user.get("role"), 40).lower(),
++    }
++    with st.expander("💬 Trao đổi theo công đoạn (Trường Thành ↔ khách hàng)", expanded=False):
++        try:
++            stage = _stage_choice("Công đoạn", f"{key_prefix}_stage")
++            thread = notes.list_stage_notes(
++                customer_id=customer, shipment_id=shipment, stage_id=stage,
++                actor=actor, db=db,
++            )
++        except notes.JourneyNoteDenied as denied:
++            st.error(_text(denied, 300) or "Không đọc được trao đổi.")
++            return
++        _render_thread(thread, key_prefix=key_prefix, db=db, actor=actor)
++        _composer(
++            key_prefix=key_prefix, db=db, actor=actor, customer_id=customer,
++            shipment_id=shipment, stage_id=stage,
++            visibility_options=("🔒 Chỉ nội bộ Trường Thành", "👁 Cho khách hàng xem"),
++            default_visibility="🔒 Chỉ nội bộ Trường Thành",
++            help_text="Ví dụ: chờ khách xác nhận địa chỉ giao hàng…",
++        )
++
++
++def render_customer_discussion(
++    cards: Sequence[Any],
++    principal: Any,
++    *,
++    db: Any = None,
++    key_prefix: str = "jd_customer",
++) -> None:
++    """Lục Giác: chỉ thấy nội dung đã cho phép, chỉ ghi vào lô của chính mình."""
++    if not cards:
++        return
++    actor = {
++        "kind": "customer",
++        "customer_id": _text(getattr(principal, "customer_id", ""), 120),
++        "name": _text(getattr(principal, "display_name", ""), 100),
++    }
++    for position, card in enumerate(cards):
++        shipment = _text(getattr(card, "reference", ""), 120)
++        if not shipment:
++            continue
++        prefix = f"{key_prefix}_{position}"
++        with st.expander(f"💬 Trao đổi công đoạn · lô {shipment}", expanded=False):
++            try:
++                stage = _stage_choice("Công đoạn", f"{prefix}_stage")
++                thread = notes.list_stage_notes(
++                    customer_id=actor["customer_id"], shipment_id=shipment,
++                    stage_id=stage, actor=actor, db=db,
++                )
++            except notes.JourneyNoteDenied as denied:
++                st.error(_text(denied, 300) or "Không đọc được trao đổi.")
++                continue
++            _render_thread(thread, key_prefix=prefix, db=db, actor=actor)
++            _composer(
++                key_prefix=prefix, db=db, actor=actor,
++                customer_id=actor["customer_id"], shipment_id=shipment, stage_id=stage,
++                visibility_options=("👁 Gửi cho Trường Thành",),
++                default_visibility="👁 Gửi cho Trường Thành",
++                help_text="Ví dụ: xác nhận địa chỉ giao hàng, hỏi chứng từ…",
++            )
+diff --git a/views/shipment.py b/views/shipment.py
+index ced33a1..39b6c16 100644
+--- a/views/shipment.py
++++ b/views/shipment.py
+@@ -671,6 +671,18 @@ def ui_shipment_detail_tabs(sid, ship):
+         from views.docgen import ui_document_pack  # noqa: PLC0415
+         ui_document_pack(sid, ship)
+ 
++    # Trao đổi theo công đoạn: cùng một luồng với cổng khách hàng, lưu trên
++    # quick_notes đang có và kho chứng từ đang cấu hình.
++    if can_edit:
++        try:
++            from views.journey_discussion import render_internal_discussion
++
++            render_internal_discussion(
++                sid, ship.get("customer_id") or "", st.session_state.get("current_user") or {},
++            )
++        except Exception as exc:  # noqa: BLE001 - a discussion pane never blocks the lot
++            st.caption(f"Không tải được trao đổi công đoạn ({type(exc).__name__}).")
++
+     with st.expander("🕒 Lịch sử thay đổi", expanded=False):
+         if audit_rows:
+             st.dataframe(
+-- 
+2.39.5
+
