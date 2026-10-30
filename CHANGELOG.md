@@ -9,7 +9,7 @@
 
 ## 2026-10-30
 
-- Cắt gọt 14 file playbook không thuộc nghiệp vụ xuất nhập khẩu.
+- Cắt gọt 13 file playbook không thuộc nghiệp vụ xuất nhập khẩu (11 playbook, analysis-advanced, SKILL.md gốc).
 
 - Sửa định tuyến Điều 191 và 194 BLHS.
 
