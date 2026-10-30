@@ -34,6 +34,17 @@ python -m pytest tests/test_customer_portal_g15_independent_challenge.py \
                  tests/test_journey_notes.py -q
 ```
 
+## Đã kiểm chứng việc áp dụng
+
+Áp dụng thử trên một clone sạch của đúng nhánh PR (`git am` cả hai patch theo
+thứ tự) → **áp dụng sạch, không xung đột**. Sau `git am` SHA commit sẽ khác
+(SHA phụ thuộc người commit/thời gian), nội dung cây không đổi. Chạy thử trên
+clone đó: **119 PASS** (`test_customer_portal_g15_independent_challenge.py`,
+`test_journey_notes.py`, `test_customer_portal_hexa_reference_ui_g15.py`,
+`test_customer_portal_publish_g15.py`, `test_customer_portal_sources_g15.py`).
+`tests/test_customer_portal_tenant_reset_g15.py` cần `npm install` trong
+`component/` (jsdom) để chạy kiểm thử DOM.
+
 ## Nội dung tóm tắt
 
 1. **G1.5 (PR #232) — kiểm chứng độc lập PASS.** 29 test challenge mới do actor
