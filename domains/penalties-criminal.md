@@ -6,16 +6,17 @@ Khung dưới đây là tham chiếu, phải đối chiếu bản hiện hành c
 | Điều | Tội danh | Ngưỡng định lượng khởi tố | Ghi chú |
 |---|---|---|---|
 | 188 | Buôn lậu | Hàng cấm theo số lượng, khối lượng; hàng khác từ 100 triệu đồng, hoặc dưới mức đó nhưng đã bị xử phạt hành chính hoặc có yếu tố khác | Khung tăng theo giá trị tang vật, cao nhất tù chung thân |
-| 189 | Vận chuyển trái phép hàng hóa, tiền tệ qua biên giới | Tương tự Điều 188 | Chủ yếu áp với người vận chuyển, hay gặp ở lái xe, hãng vận tải |
+| 189 | Vận chuyển trái phép hàng hóa, tiền tệ qua biên giới | Từ 100 triệu đồng đến dưới 300 triệu đồng; hàng cấm theo số lượng, khối lượng | Chủ yếu áp với người vận chuyển, hay gặp ở lái xe, hãng vận tải |
 | 190 | Sản xuất, buôn bán hàng giả | Theo giá trị hoặc số lượng tùy loại hàng | |
 | 191 | Buôn bán hàng giả là lương thực, thực phẩm, thuốc chữa bệnh, thuốc phòng bệnh | Thấp hơn Điều 190 | |
 | 192 | Buôn bán hàng giả là thức ăn chăn nuôi, phân bón, thuốc thú y, thuốc bảo vệ thực vật, giống | Thấp hơn Điều 190 | |
 | 193 | Đầu cơ | Theo số lượng, giá trị hàng hóa | |
-| 194 | Trốn thuế | Từ 100 triệu đồng, hoặc dưới mức đó nhưng đã bị xử phạt | Khung tăng theo số thuế trốn |
-| 200 | Vi phạm quy định về bảo vệ động vật nguy cấp, quý, hiếm | Theo loài và số lượng | Gắn với CITES |
+| 194 | Sản xuất, buôn bán hàng giả là thuốc chữa bệnh, thuốc phòng bệnh | Theo giá trị hoặc số lượng | Cần xác minh ranh giới với Điều 191 |
+| 200 | Trốn thuế | Từ 100 triệu đồng, hoặc dưới mức đó nhưng đã bị xử phạt | Khung tăng theo số thuế trốn |
 | 226 | Xâm phạm quyền sở hữu công nghiệp | Theo giá trị hàng hóa hoặc thiệt hại | |
 | 234 | Vi phạm quy định về quản lý chất thải nguy hại | Theo khối lượng | |
 | 236 | Vi phạm quy định về bảo vệ môi trường | Theo mức độ thiệt hại | |
+| 244 | Vi phạm quy định về bảo vệ động vật nguy cấp, quý, hiếm | Theo loài và số lượng | Gắn với CITES |
 
 ## Nguyên tắc
 1. Cùng một hành vi có thể vừa bị phạt hành chính vừa bị truy cứu hình sự. Luôn nêu cả hai.
@@ -26,3 +27,4 @@ Khung dưới đây là tham chiếu, phải đối chiếu bản hiện hành c
 ## Cần xác minh
 - Khung hình phạt từng khoản theo bản hiện hành của BLHS.
 - Ngưỡng định lượng chính xác của từng điều.
+- Ranh giới giữa Điều 191 và Điều 194 với hàng giả là thuốc; ngưỡng chính xác của Điều 189.
